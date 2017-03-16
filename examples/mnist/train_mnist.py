@@ -10,12 +10,26 @@ except ImportError:
 
 import argparse
 
+import numpy
+
 import chainer
 import chainer.functions as F
 import chainer.links as L
 from chainer import training
 from chainer.training import extensions
+from chainer import graph_summary
 
+
+import matplotlib
+matplotlib.use('Agg')
+
+
+graph = graph_summary.Graph('root_graph')
+graph.config_node('g/hh', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+graph.config_node('g/g2/h2_relu', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+graph.config_node('g/g2/h2_sigmoid', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+
+iii = 0
 
 # Network definition
 class MLP(chainer.Chain):
@@ -29,9 +43,43 @@ class MLP(chainer.Chain):
             self.l3 = L.Linear(None, n_out)  # n_units -> n_out
 
     def __call__(self, x):
-        h1 = F.relu(self.l1(x))
-        h2 = F.relu(self.l2(h1))
-        return self.l3(h2)
+        global iii
+
+        with graph_summary.graph([x], 'g') as g:
+            g.config_node(x, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((28,28)))
+            h = self.l1(x)
+
+            g.set_tag(h, 'hh')
+
+            if iii % 2 == 0:
+                h = F.relu(h)
+                g.set_tag(h, 'h1_relu')
+            else:
+                h = F.sigmoid(h)
+                g.set_tag(h, 'h1_sigmoid')
+
+            g.config_node(h, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+
+            with graph_summary.graph([h], 'g2') as g2:
+                g2.config_node(h, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+                if iii % 2 == 0:
+                    h = F.relu(self.l2(h))
+                    g2.set_tag(h, 'h2_relu')
+                else:
+                    h = F.sigmoid(self.l2(h))
+                    g2.set_tag(h, 'h2_sigmoid')
+
+                # output variables can't have tags (currently)...
+                # This dummy function is the workaround.
+                h = h + 0
+
+                g2.set_output([h])
+
+            h = self.l3(h)
+            g.set_output([h])
+
+        iii += 1
+        return h
 
 
 def main():
@@ -73,6 +121,7 @@ def main():
 
     # Load the MNIST dataset
     train, test = chainer.datasets.get_mnist()
+    #train = train[:10]
 
     train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
     test_iter = chainer.iterators.SerialIterator(test, args.batchsize,
@@ -82,8 +131,10 @@ def main():
     updater = training.StandardUpdater(train_iter, optimizer, device=args.gpu)
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
+    trainer.extend(graph_summary.GraphSummary(graph, ['main/loss']))
+
     # Evaluate the model with the test dataset for each epoch
-    trainer.extend(extensions.Evaluator(test_iter, model, device=args.gpu))
+    #trainer.extend(extensions.Evaluator(test_iter, model, device=args.gpu))
 
     # Dump a computational graph from 'loss' variable at the first iteration
     # The "main" refers to the target link of the "main" optimizer.
@@ -94,9 +145,10 @@ def main():
     trainer.extend(extensions.snapshot(), trigger=(frequency, 'epoch'))
 
     # Write a log of evaluation statistics for each epoch
-    trainer.extend(extensions.LogReport())
+    #trainer.extend(extensions.LogReport())
 
     # Save two plot images to the result dir
+    """
     if extensions.PlotReport.available():
         trainer.extend(
             extensions.PlotReport(['main/loss', 'validation/main/loss'],
@@ -105,15 +157,18 @@ def main():
             extensions.PlotReport(
                 ['main/accuracy', 'validation/main/accuracy'],
                 'epoch', file_name='accuracy.png'))
+    """
 
     # Print selected entries of the log to stdout
     # Here "main" refers to the target link of the "main" optimizer again, and
     # "validation" refers to the default name of the Evaluator extension.
     # Entries other than 'epoch' are reported by the Classifier link, called by
     # either the updater or the evaluator.
+    """
     trainer.extend(extensions.PrintReport(
         ['epoch', 'main/loss', 'validation/main/loss',
          'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+    """
 
     # Print a progress bar to stdout
     trainer.extend(extensions.ProgressBar())
@@ -123,8 +178,18 @@ def main():
         chainer.serializers.load_npz(args.resume, trainer)
 
     # Run the training
+    print("Starting graph server")
+    graph_summary.run_server(graph, async=True)
     trainer.run()
 
+    import time
+    time.sleep(1000)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        import pdb
+        pdb.post_mortem()

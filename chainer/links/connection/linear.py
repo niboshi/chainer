@@ -1,5 +1,6 @@
 from chainer.functions.connection import linear
 from chainer import initializers
+from chainer import graph_summary
 from chainer import link
 from chainer import variable
 
@@ -124,4 +125,7 @@ class Linear(link.Link):
         """
         if self.W.data is None:
             self._initialize_params(x.size // x.shape[0])
-        return linear.linear(x, self.W, self.b)
+        with graph_summary.graph([x], 'linear' + ('_' + self.name if self.name else '')) as g:
+            y = linear.linear(x, self.W, self.b)
+            g.set_output([y])
+        return y

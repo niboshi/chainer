@@ -12,10 +12,13 @@ from chainer.training import trigger as trigger_module
 
 class _ExtensionEntry(object):
 
-    def __init__(self, extension, priority, trigger, invoke_before_training):
+    def __init__(self, extension, priority, trigger, invoke_before_training,
+                 invoke_before_update, invoke_after_update):
         self.extension = extension
         self.trigger = trigger
         self.invoke_before_training = invoke_before_training
+        self.invoke_before_update = invoke_before_update
+        self.invoke_after_update = invoke_after_update
         self.priority = priority
 
 
@@ -160,7 +163,8 @@ class Trainer(object):
         return time.time() - self._start_at + self._snapshot_elapsed_time
 
     def extend(self, extension, name=None, trigger=None, priority=None,
-               invoke_before_training=None):
+               invoke_before_training=None, invoke_before_update=None,
+               invoke_after_update=None):
         """Registers an extension to the trainer.
 
         :class:`Extension` is a callable object which is called after each
@@ -225,6 +229,12 @@ class Trainer(object):
         if invoke_before_training is None:
             invoke_before_training = getattr(
                 extension, 'invoke_before_training', False)
+        if invoke_before_update is None:
+            invoke_before_update = getattr(
+                extension, 'invoke_before_update', False)
+        if invoke_after_update is None:
+            invoke_after_update = getattr(
+                extension, 'invoke_after_update', True)
 
         modified_name = name
         ordinal = 0
@@ -234,7 +244,8 @@ class Trainer(object):
 
         extension.name = modified_name
         self._extensions[modified_name] = _ExtensionEntry(
-            extension, priority, trigger, invoke_before_training)
+            extension, priority, trigger, invoke_before_training,
+            invoke_before_update, invoke_after_update)
 
     def get_extension(self, name):
         """Returns the extension of a given name.
@@ -293,10 +304,15 @@ class Trainer(object):
             while not stop_trigger(self):
                 self.observation = {}
                 with reporter.scope(self.observation):
+                    for name, entry in extensions:
+                        if entry.invoke_before_update:
+                            if entry.trigger(self):
+                                entry.extension(self)
                     update()
                     for name, entry in extensions:
-                        if entry.trigger(self):
-                            entry.extension(self)
+                        if entry.invoke_after_update:
+                            if entry.trigger(self):
+                                entry.extension(self)
         finally:
             for _, entry in extensions:
                 finalize = getattr(entry.extension, 'finalize', None)
