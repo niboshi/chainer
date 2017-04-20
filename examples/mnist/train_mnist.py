@@ -25,9 +25,38 @@ matplotlib.use('Agg')
 
 
 graph = graph_summary.Graph('root_graph')
-graph.config_node('g/hh', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
-graph.config_node('g/g2/h2_relu', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
-graph.config_node('g/g2/h2_sigmoid', data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+graph.config_node(
+    'g/hh',
+    data=['image', dict(
+        data_reduce='average',
+        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+        store_trigger=(1, 'epoch'),
+        reset_trigger=(1, 'epoch'),
+    )])
+graph.config_node(
+    'g/g2/h2_relu',
+    data=dict(
+        data_reduce='average',
+        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+        store_trigger=(1, 'epoch'),
+        reset_trigger=(1, 'epoch'),
+    ))
+graph.config_node(
+    'g/g2/h2_sigmoid',
+    data=dict(
+        data_reduce='average',
+        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+        store_trigger=(1, 'epoch'),
+        reset_trigger=(1, 'epoch'),
+    ))
+graph.config_node(
+    'g/g2/h2_sigmoid',
+    data=[('image', dict(
+        data_reduce='average',
+        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+        store_trigger=(1, 'epoch'),
+        reset_trigger=(1, 'epoch'),
+    ))])
 
 iii = 0
 
@@ -46,7 +75,7 @@ class MLP(chainer.Chain):
         global iii
 
         with graph_summary.graph([x], 'g') as g:
-            g.config_node(x, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((28,28)))
+            g.config_node(x, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((28,28))))
             h = self.l1(x)
 
             g.set_tag(h, 'hh')
@@ -58,10 +87,10 @@ class MLP(chainer.Chain):
                 h = F.sigmoid(h)
                 g.set_tag(h, 'h1_sigmoid')
 
-            g.config_node(h, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+            g.config_node(h, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40))))
 
             with graph_summary.graph([h], 'g2') as g2:
-                g2.config_node(h, data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40)))
+                g2.config_node(h, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40))))
                 if iii % 2 == 0:
                     h = F.relu(self.l2(h))
                     g2.set_tag(h, 'h2_relu')

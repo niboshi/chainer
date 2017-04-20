@@ -1,6 +1,7 @@
 import contextlib
 import itertools
 import threading
+from six.moves import urllib
 import sys
 import wsgiref
 import weakref
@@ -11,6 +12,8 @@ from chainer import cuda
 from chainer import variable
 from chainer import function
 from chainer.training import extension
+from chainer.training import trainer as trainer_module
+from chainer.training import trigger as trigger_module
 
 
 if cuda.available:
@@ -39,8 +42,9 @@ def _get_obj(obj):
         return obj
 
 
-class GnodeConfig(object):
-    def __init__(self, data_reduce=None, preprocess=None):
+class DataSeriesConfig(object):
+    def __init__(self, data_reduce=None, preprocess=None,
+                 store_trigger=None, reset_trigger=None):
         if data_reduce == 'average':
             data_reduce = (
                 (lambda x: x.copy()),
@@ -54,8 +58,142 @@ class GnodeConfig(object):
         if preprocess is not None:
             assert callable(preprocess)
 
+        store_trigger = trigger_module.get_trigger(store_trigger)
+        reset_trigger = trigger_module.get_trigger(reset_trigger)
+
         self.data_reduce = data_reduce
         self.preprocess = preprocess
+        self.store_trigger = store_trigger
+        self.reset_trigger = reset_trigger
+
+
+class GnodeConfig(object):
+    def __init__(self, data=None):
+        self.data_series_configs = self._make_data_series_configs(data, {})
+
+    def _make_data_series_configs(self, data_spec, configs):
+        assert isinstance(configs, dict)
+
+        if isinstance(data_spec, dict):
+            data_spec = [('data', data_spec)]
+
+        elif isinstance(data_spec, (tuple, list)) and len(data_spec) == 2:
+            data_spec = [data_spec]
+
+        if (not isinstance(data_spec, (tuple, list)) or
+            not all(len(_) == 2 for _ in data_spec) or
+            not all(isinstance(_[0], str) for _ in data_spec) or
+            not all(isinstance(_[1], dict) for _ in data_spec)):
+            raise ValueError("Invalid data specification.")
+
+        for name, kwargs in data_spec:
+            assert isinstance(name, str)
+            assert isinstance(kwargs, dict)
+            if name not in configs:
+                configs[name] = DataSeriesConfig(**kwargs)
+
+        return configs
+
+
+class DataSeries(object):
+    def __init__(self, config):
+        self._data_list = []
+        self._current_data = None
+        self._config = config
+        self._copy_on_write = False
+        self.sample_count = 0
+        self._epoch_to_idx = {}
+
+    def get_data(self, index):
+        epoch, data = self._data_list[index]
+        return epoch, data
+
+    def get_iterations(self):
+        return [_[0] for _ in self._data_list]
+
+    def add_sample(self, data, trainer=None):
+        assert isinstance(data, _ndarrays)
+        config = self._config
+
+        # Preparation
+        if self._copy_on_write:
+            if self._current_data is not None:
+                self._current_data = self._current_data.copy()
+            self._copy_on_write = False
+
+        # Add sample
+        if config.data_reduce is not None:
+            if config.preprocess:
+                data = config.preprocess(data)
+
+            current_data = self._current_data
+            if current_data is None:
+                func_init = config.data_reduce[0]
+                current_data = func_init(data)
+            else:
+                func_reduce = config.data_reduce[1]
+                current_data = func_reduce(current_data, data, self.sample_count)
+            self._current_data = current_data
+
+        self.sample_count += 1
+
+        # Store data
+        if config.store_trigger is not None:
+            if config.store_trigger(trainer):
+                self.store_current(trainer.updater.epoch_detail)
+
+        # Reset data
+        if config.reset_trigger is not None:
+            if config.reset_trigger(trainer):
+                self.reset_current()
+
+    def store_current(self, epoch):
+        data = self._as_array(self._current_data)
+        self._data_list.append((epoch, data))
+
+        # Mark _current_data as copy-on-write
+        self._copy_on_write = True
+
+    def reset_current(self):
+        self._current_data = None
+        self._copy_on_write = False
+
+    def _as_array(self, data):
+        if cuda.available:
+            data = cupy.asnumpy(data)
+        assert isinstance(data, numpy.ndarray)
+        return data
+
+
+class DataCollection(object):
+    def __init__(self):
+        self._data_series_dict = {}
+
+    def __getitem__(self, name):
+        return self._data_series_dict[name]
+
+    def get_names(self):
+        return self._data_series_dict.keys()
+
+    def get_summary(self):
+        summary = {}
+        for name in sorted(self._data_series_dict.keys()):
+            data_series = self._data_series_dict[name]
+            iter_keys = data_series.get_iterations()
+            summary[name] = iter_keys
+
+        return summary
+
+
+    def add_sample(self, data, trainer=None):
+        for name,data_series in self._data_series_dict.items():
+            data_series.add_sample(data, trainer)
+
+    def ensure_data_series_prepared(self, name, config):
+        assert isinstance(name, str)
+        assert isinstance(config, DataSeriesConfig)
+        if name not in self._data_series_dict:
+            self._data_series_dict[name] = DataSeries(config)
 
 
 class Gnode(object):
@@ -71,6 +209,7 @@ class Gnode(object):
         self.extra_clue = extra_clue
         self.kind = Gnode._get_kind(obj_type)
 
+        # node_config could either be dict or GnodeConfig.
         self.node_config = None
 
         # Variable: .name
@@ -79,6 +218,9 @@ class Gnode(object):
         self.name = name
 
     def set_node_config(self, node_config):
+        assert isinstance(node_config, (GnodeConfig, dict))
+        if isinstance(node_config, dict):
+            assert 'data' not in node_config
         self.node_config = node_config
 
     @property
@@ -173,8 +315,8 @@ class VariableGnode(Gnode):
         self.dtype = var.dtype
         self.name = name
 
-        self.sample_count = 0
-        self.data = None
+        self.data_collection = DataCollection()
+
 
     @classmethod
     def get_extra_clue(cls, var, tag):
@@ -194,24 +336,19 @@ class VariableGnode(Gnode):
         return '<{}>'.format(
             ' '.join(str(_) for _ in lst if _ is not None))
 
-    def add_data_sample(self, data):
+    def _prepare_data_collection(self, data_series_configs):
+        assert isinstance(data_series_configs, dict)
+        for name, config in data_series_configs.items():
+            self.data_collection.ensure_data_series_prepared(name, config)
+
+    def add_data_sample(self, data, trainer):
         assert isinstance(data, _ndarrays)
         node_config = self.node_config
         if node_config is None:
             return
 
-        if node_config.data_reduce is not None:
-            if node_config.preprocess:
-                data = node_config.preprocess(data)
-
-            if self.sample_count == 0:
-                func_init = node_config.data_reduce[0]
-                self.data = func_init(data)
-            else:
-                func_reduce = node_config.data_reduce[1]
-                self.data = func_reduce(self.data, data, self.sample_count)
-
-            self.sample_count += 1
+        self._prepare_data_collection(node_config.data_series_configs)
+        self.data_collection.add_sample(data, trainer)
 
 
 class FunctionGnode(Gnode):
@@ -323,6 +460,8 @@ class Graph(object):
         d[tag_path[-1]] = GnodeConfig(**kwargs)
 
     def get_node_config(self, tag):
+        """Returns a GnodeConfig (leaf) or a dict (subgraph) or None (not found)"""
+
         if self._node_configs is not None:
             config = self._node_configs.get(tag)
             if config is not None:
@@ -642,11 +781,11 @@ class GraphContext(object):
 
         self._output_variables_of_last_pass = []
 
-    def start_pass(self, inputs):
+    def start_pass(self, inputs, trainer=None):
         # See: comment of end_pass()
         last_outputs = [_() for _ in self._output_variables_of_last_pass]
         last_outputs = [_ for _ in last_outputs if _ is not None]
-        self._init_pass(inputs, last_outputs)
+        self._init_pass(inputs, last_outputs, trainer)
 
     def end_pass(self):
         # Weakly keep the output variables of this pass.
@@ -658,11 +797,12 @@ class GraphContext(object):
 
         self._cleanup_pass()
 
-    def _init_pass(self, inputs, last_outputs):
+    def _init_pass(self, inputs, last_outputs, trainer):
         self._closed = False
         self.nodes = set()
         self._var_unnamed_tag_counter = 0
         self.buffered_node_configs = None
+        self.trainer = trainer
 
         # chainer.Variable
         self.output_variables = None
@@ -693,6 +833,8 @@ class GraphContext(object):
                 self._memorize_variable(v)
 
     def _cleanup_pass(self):
+        # TODO: These variables and related operations could be capsulated into
+        #       a separate class.
         del self.nodes
         del self.buffered_node_configs
         del self.output_variables
@@ -704,6 +846,7 @@ class GraphContext(object):
         del self.variable_node_map
         del self.subgraph_map
         del self.subgraph_output_map
+        del self.trainer
 
     def set_output(self, outputs):
         self.debug("set_output: {}".format(outputs))
@@ -800,11 +943,12 @@ class GraphContext(object):
         else:
             assert False
 
+        #
         self.debug("config_node: {}".format(tag))
         if self.buffered_node_configs is None:
             self.buffered_node_configs = []
         self.buffered_node_configs.append((
-            tag, kwargs
+            tag, GnodeConfig(**kwargs)
         ))
 
     def debug(self, s):
@@ -1077,11 +1221,11 @@ class GraphContext(object):
     def _submit_buffered_node_configs(self):
         if self.buffered_node_configs is None:
             return
-        for tag, kwargs in self.buffered_node_configs:
+        for tag, node_config in self.buffered_node_configs:
             gnode = self.graph.node_map[tag]
             if not isinstance(gnode, VariableGnode):
                 raise NotImplementedError('Currently only variable nodes have data statistics')
-            gnode.set_node_config(GnodeConfig(**kwargs))
+            gnode.set_node_config(node_config)
 
         self.buffered_node_configs = None
 
@@ -1098,7 +1242,7 @@ class GraphContext(object):
                     else:
                         data = mnode.obj
                     self.debug('Add data sample: {}'.format(gnode.tag))
-                    gnode.add_data_sample(data)
+                    gnode.add_data_sample(data, self.trainer)
 
 
 class DummyGraphContext(object):
@@ -1116,7 +1260,9 @@ class DummyGraphContext(object):
 
 
 @contextlib.contextmanager
-def root_graph(input_variables, graph, context=None):
+def root_graph(input_variables, graph, trainer=None, context=None):
+    assert trainer is None or isinstance(trainer, trainer_module.Trainer)
+    assert context is None or isinstance(context, GraphContext)
     current_thread = threading.current_thread()
 
     graph.lock()
@@ -1124,7 +1270,7 @@ def root_graph(input_variables, graph, context=None):
     if context is None:
         context = GraphContext(graph.tag, graph)
     current_thread.__dict__['graph_context'] = context
-    context.start_pass(input_variables)
+    context.start_pass(input_variables, trainer=trainer)
 
     try:
         yield context
@@ -1148,7 +1294,7 @@ class graph(object):
 
     def __enter__(self):
         if not self.enable:
-            return DummyGraphContext()
+            context = DummyGraphContext()
         else:
             current_thread = threading.current_thread()
             outer_context = current_thread.__dict__.get('graph_context', None)
@@ -1167,12 +1313,12 @@ class graph(object):
             context = GraphContext(tag, graph)
             current_thread.__dict__['graph_context'] = context
 
-            context.start_pass(input_variables)
-
-            self.context = context
+            context.start_pass(input_variables, trainer=outer_context.trainer)
 
             self.outer_context = outer_context
-            return context
+
+        self.context = context
+        return context
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self.enable:
@@ -1216,7 +1362,7 @@ class GraphSummary(extension.Extension):
     def __call__(self, trainer):
         if self._ctx is None:
             # Before update
-            self._ctx = root_graph([], self.graph, self.context)
+            self._ctx = root_graph([], self.graph, trainer, self.context)
             self._ctx.__enter__()
         else:
             # After update
@@ -1285,7 +1431,7 @@ def get_obj(path):
     return graph
 
 
-def api(api_name, path, environ):
+def api(api_name, path, query, environ):
     method = environ['REQUEST_METHOD']
     if api_name == 'graph' and method == 'GET':
         nodes = []
@@ -1349,8 +1495,9 @@ def api(api_name, path, environ):
 
                 # data
                 if isinstance(node, VariableGnode):
-                    if node.data is not None:
-                        d_node['has_data'] = True
+                    summary = node.data_collection.get_summary()
+                    if len(summary) > 0:
+                        d_node['data_summary'] = summary
 
                 #
                 nodes.append(d_node)
@@ -1378,12 +1525,13 @@ def api(api_name, path, environ):
         return 'application/json', json_data
 
     if api_name == 'data' and method == 'GET':
-        node = get_obj(path)
+        def read_query(key, type=str):
+            return type(query[key][0])
+        data_name = read_query('name')
+        data_index = read_query('index', int)
 
-        if cuda.available:
-            arr = cupy.asnumpy(node.data)
-        else:
-            arr = node.data
+        node = get_obj(path)
+        _, arr = node.data_collection[data_name].get_data(data_index)
 
         if arr is None:
             json_data = '{}'
@@ -1421,10 +1569,11 @@ def graph_app(environ, start_response):
     path = environ['PATH_INFO']
     path = path[1:] if path.startswith('/') else path
     root_path, path = pop_path(path)
+    query = urllib.parse.parse_qs(environ['QUERY_STRING'])
 
     if root_path == 'api':
         api_name, path = pop_path(path)
-        content_type, data = api(api_name,path, environ)
+        content_type, data = api(api_name, path, query, environ)
         if isinstance(data, str):
             data = data.encode('utf-8')
     else:
