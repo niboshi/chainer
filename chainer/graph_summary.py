@@ -1457,6 +1457,8 @@ def api(api_name, path, query, environ):
                 # type
                 if node.obj_type in (variable.VariableNode,) + _ndarrays:
                     d_node['type'] = 'variable'
+                    d_node['shape'] = list(node.shape)
+                    d_node['dtype'] = node.dtype.name
                 elif node.obj_type is Graph:
                     d_node['type'] = 'subgraph'
                     d_node['path'] = '{}/{}'.format(path, node.tag)
