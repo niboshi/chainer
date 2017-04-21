@@ -105,11 +105,17 @@ class DataSeries(object):
         self._epoch_to_idx = {}
 
     def get_data(self, index):
-        epoch, data = self._data_list[index]
+        if index < len(self._data_list):
+            epoch, data = self._data_list[index]
+        elif index == len(self._data_list):
+            epoch = None
+            data = self._as_array(self._current_data)
         return epoch, data
 
     def get_iterations(self):
-        return [_[0] for _ in self._data_list]
+        epochs = [_[0] for _ in self._data_list]
+        # The last `None` represents the latest data
+        return epochs + [None]
 
     def add_sample(self, data, trainer=None):
         assert isinstance(data, _ndarrays)
