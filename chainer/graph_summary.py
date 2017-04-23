@@ -109,7 +109,10 @@ class DataSeries(object):
             epoch, data = self._data_list[index]
         elif index == len(self._data_list):
             epoch = None
-            data = self._as_array(self._current_data)
+            if self._current_data is not None:
+                data = self._as_array(self._current_data)
+            else:
+                data = self._data_list[-1][1]
         return epoch, data
 
     def get_iterations(self):
@@ -166,7 +169,7 @@ class DataSeries(object):
 
     def _as_array(self, data):
         if cuda.available:
-            data = cupy.asnumpy(data)
+            data = cuda.cupy.asnumpy(data)
         assert isinstance(data, numpy.ndarray)
         return data
 
@@ -1556,7 +1559,7 @@ def api(api_name, path, query, environ):
             ax.pcolormesh(arr)
             buf = io.BytesIO()
             fig.savefig(buf, format='png')
-            fig.clear()
+            matplotlib.pyplot.close(fig)
             png_data = buf.getvalue()
 
         return 'image/png', png_data
