@@ -49,6 +49,10 @@ class DataSeriesConfig(object):
             data_reduce = (
                 (lambda x: x.copy()),
                 (lambda acc,x,i: acc * (i / float(i+1)) + x / (float(i+1))))
+        elif data_reduce == 'overwrite':
+            data_reduce = (
+                (lambda x: x.copy()),
+                (lambda acc,x,i: x.copy()))
 
         if data_reduce is not None:
             assert len(data_reduce) == 2
@@ -71,13 +75,18 @@ class GnodeConfig(object):
     def __init__(self, data=None):
         self.data_series_configs = self._make_data_series_configs(data, {})
 
+    def _is_good_config_tuple(self, tup):
+        return (len(tup) == 2 and
+                isinstance(tup[0], str) and
+                isinstance(tup[1], dict))
+
     def _make_data_series_configs(self, data_spec, configs):
         assert isinstance(configs, dict)
 
         if isinstance(data_spec, dict):
             data_spec = [('data', data_spec)]
 
-        elif isinstance(data_spec, (tuple, list)) and len(data_spec) == 2:
+        elif self._is_good_config_tuple(data_spec):
             data_spec = [data_spec]
 
         if (not isinstance(data_spec, (tuple, list)) or
@@ -105,14 +114,15 @@ class DataSeries(object):
         self._epoch_to_idx = {}
 
     def get_data(self, index):
-        if index < len(self._data_list):
-            epoch, data = self._data_list[index]
-        elif index == len(self._data_list):
+        if index is None:
             epoch = None
             if self._current_data is not None:
                 data = self._as_array(self._current_data)
             else:
                 data = self._data_list[-1][1]
+        else:
+            assert 0 <= index < len(self._data_list)
+            epoch, data = self._data_list[index]
         return epoch, data
 
     def get_iterations(self):
@@ -1540,6 +1550,8 @@ def api(api_name, path, query, environ):
             return type(query[key][0])
         data_name = read_query('name')
         data_index = read_query('index', int)
+        if data_index == -1:
+            data_index = None
 
         node = get_obj(path)
         _, arr = node.data_collection[data_name].get_data(data_index)
