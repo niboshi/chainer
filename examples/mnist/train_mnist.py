@@ -24,40 +24,6 @@ import matplotlib
 matplotlib.use('Agg')
 
 
-graph = graph_summary.Graph('root_graph')
-graph.config_node(
-    'g/hh',
-    data=['image', dict(
-        data_reduce='average',
-        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-        store_trigger=(1, 'epoch'),
-        reset_trigger=(1, 'epoch'),
-    )])
-graph.config_node(
-    'g/g2/h2_relu',
-    data=dict(
-        data_reduce='average',
-        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-        store_trigger=(1, 'epoch'),
-        reset_trigger=(1, 'epoch'),
-    ))
-graph.config_node(
-    'g/g2/h2_sigmoid',
-    data=dict(
-        data_reduce='average',
-        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-        store_trigger=(1, 'epoch'),
-        reset_trigger=(1, 'epoch'),
-    ))
-graph.config_node(
-    'g/g2/h2_sigmoid',
-    data=[('image', dict(
-        data_reduce='average',
-        preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-        store_trigger=(1, 'epoch'),
-        reset_trigger=(1, 'epoch'),
-    ))])
-
 iii = 0
 
 # Network definition
@@ -75,7 +41,18 @@ class MLP(chainer.Chain):
         global iii
 
         with graph_summary.graph([x], 'g') as g:
-            g.config_node(x, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((28,28))))
+            g.config_node(x, data=[
+                ('latest', dict(
+                    data_reduce='overwrite',
+                    preprocess=lambda x: x[-1,:].reshape((28,28)),
+                )),
+                ('average', dict(
+                    data_reduce='average',
+                    preprocess=lambda x: x.mean(axis=0).reshape((28,28)),
+                    store_trigger=(1, 'epoch'),
+                    reset_trigger=(1, 'epoch'),
+                )),
+            ])
             h = self.l1(x)
 
             g.set_tag(h, 'hh')
@@ -87,10 +64,20 @@ class MLP(chainer.Chain):
                 h = F.sigmoid(h)
                 g.set_tag(h, 'h1_sigmoid')
 
-            g.config_node(h, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40))))
+            g.config_node(h, data=dict(
+                data_reduce='average',
+                preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+                store_trigger=(1, 'epoch'),
+                reset_trigger=(1, 'epoch'),
+            ))
 
             with graph_summary.graph([h], 'g2') as g2:
-                g2.config_node(h, data=dict(data_reduce='average', preprocess=lambda x: x.mean(axis=0).reshape((25, 40))))
+                g2.config_node(h, data=dict(
+                    data_reduce='average',
+                    preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+                    store_trigger=(1, 'epoch'),
+                    reset_trigger=(1, 'epoch'),
+                ))
                 if iii % 2 == 0:
                     h = F.relu(self.l2(h))
                     g2.set_tag(h, 'h2_relu')
@@ -109,6 +96,48 @@ class MLP(chainer.Chain):
 
         iii += 1
         return h
+
+
+def init_graph():
+    graph = graph_summary.Graph('root_graph')
+    graph.config_node(
+        'g/hh',
+        data=[
+            ('latest', dict(
+                data_reduce='overwrite',
+                preprocess=lambda x: x[-1,:].reshape((25, 40)),
+            )),
+            ('average', dict(
+                data_reduce='average',
+                preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+                store_trigger=(1, 'epoch'),
+                reset_trigger=(1, 'epoch'),
+            ))])
+    graph.config_node(
+        'g/g2/h2_relu',
+        data=dict(
+            data_reduce='overwrite',
+            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+            store_trigger=(1, 'epoch'),
+            reset_trigger=(1, 'epoch'),
+        ))
+    graph.config_node(
+        'g/g2/h2_sigmoid',
+        data=dict(
+            data_reduce='average',
+            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+            store_trigger=(1, 'epoch'),
+            reset_trigger=(1, 'epoch'),
+        ))
+    graph.config_node(
+        'g/g2/h2_sigmoid',
+        data=[('image', dict(
+            data_reduce='average',
+            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+            store_trigger=(1, 'epoch'),
+            reset_trigger=(1, 'epoch'),
+        ))])
+    return graph
 
 
 def main():
@@ -160,6 +189,7 @@ def main():
     updater = training.StandardUpdater(train_iter, optimizer, device=args.gpu)
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
+    graph = init_graph()
     trainer.extend(graph_summary.GraphSummary(graph, ['main/loss']))
 
     # Evaluate the model with the test dataset for each epoch
