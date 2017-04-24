@@ -3,10 +3,11 @@ import itertools
 import threading
 from six.moves import urllib
 import sys
-import wsgiref
 import weakref
 
 import numpy
+import werkzeug
+import werkzeug.serving
 
 from chainer import cuda
 from chainer import variable
@@ -1391,16 +1392,10 @@ class GraphSummary(extension.Extension):
             self._ctx = None
 
 
-from wsgiref import simple_server
-
-
 server_graph = None
 
-import threading
-
 def _do_run_server():
-    server = simple_server.make_server('', 6007, graph_app)
-    server.serve_forever()
+    werkzeug.serving.run_simple('localhost', 6007, graph_app)
 
 def run_server(graph, async=False):
     global server_graph
@@ -1586,8 +1581,9 @@ def pop_path(path):
     else:
         return split[0], split[1]
 
+#@werkzeug.wrappers.Request.application
 def graph_app(environ, start_response):
-    status = '200 OK'
+    status = 200
 
     path = environ['PATH_INFO']
     path = path[1:] if path.startswith('/') else path
@@ -1603,9 +1599,8 @@ def graph_app(environ, start_response):
         data = b'Error: Invalid request'
         content_type = 'text/plain'
 
-    response_headers = [
-        ('Content-Type', content_type),
-        ('Access-Control-Allow-Origin', '*'),
-    ]
-    start_response(status, response_headers)
-    return [data]
+    response = werkzeug.wrappers.Response(data)
+    response.status_code = status
+    response.headers['content-type'] = content_type
+    response.headers['access-control-allow-origin'] = '*'
+    return response(environ, start_response)
