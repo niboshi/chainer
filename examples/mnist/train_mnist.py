@@ -41,14 +41,15 @@ class MLP(chainer.Chain):
         global iii
 
         with graph_summary.graph([x], 'g') as g:
+            g.set_tag(x, 'input')
             g.config_node(x, data=[
                 ('latest', dict(
                     data_reduce='overwrite',
-                    preprocess=lambda x: x[-1,:].reshape((28,28)),
+                    preprocess=lambda x: x[-1,:].reshape((28,28))[-1::-1,:],
                 )),
                 ('average', dict(
                     data_reduce='average',
-                    preprocess=lambda x: x.mean(axis=0).reshape((28,28)),
+                    preprocess=lambda x: x.mean(axis=0).reshape((28,28))[-1::-1,:],
                     store_trigger=(1, 'epoch'),
                     reset_trigger=(1, 'epoch'),
                 )),
@@ -92,6 +93,19 @@ class MLP(chainer.Chain):
                 g2.set_output([h])
 
             h = self.l3(h)
+            g.set_tag(h, 'output')
+            g.config_node(h, data=[
+                ('latest', dict(
+                    data_reduce='overwrite',
+                    preprocess=lambda x: x[-1,:].reshape(1,10),
+                )),
+                ('average', dict(
+                    data_reduce='average',
+                    preprocess=lambda x: x[-1,:].reshape(1,10),
+                    store_trigger=(1, 'epoch'),
+                    reset_trigger=(1, 'epoch'),
+                )),
+            ])
             g.set_output([h])
 
         iii += 1
