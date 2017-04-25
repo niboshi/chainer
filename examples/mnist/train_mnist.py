@@ -44,7 +44,6 @@ class MLP(chainer.Chain):
             g.set_tag(x, 'input')
             g.config_node(x, data=[
                 ('latest', dict(
-                    data_reduce='overwrite',
                     preprocess=lambda x: x[-1,:].reshape((28,28))[-1::-1,:],
                 )),
                 ('average', dict(
@@ -96,7 +95,6 @@ class MLP(chainer.Chain):
             g.set_tag(h, 'output')
             g.config_node(h, data=[
                 ('latest', dict(
-                    data_reduce='overwrite',
                     preprocess=lambda x: x[-1,:].reshape(1,10),
                 )),
                 ('average', dict(
@@ -111,6 +109,12 @@ class MLP(chainer.Chain):
         iii += 1
         return h
 
+def _combine_ndim_mean_std(mean_std, n):
+    mean, std = mean_std
+    total_mean = mean.mean()
+    total_var = ((std * std).sum() + ((mean - total_mean) ** 2).sum()) / std.size
+    total_std = numpy.sqrt(total_var)
+    return (total_mean, total_std)
 
 def init_graph():
     graph = graph_summary.Graph('root_graph')
@@ -118,7 +122,6 @@ def init_graph():
         'g/hh',
         data=[
             ('latest', dict(
-                data_reduce='overwrite',
                 preprocess=lambda x: x[-1,:].reshape((25, 40)),
             )),
             ('average', dict(
@@ -126,11 +129,16 @@ def init_graph():
                 preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
                 store_trigger=(1, 'epoch'),
                 reset_trigger=(1, 'epoch'),
-            ))])
+            )),
+            ('mean-std', dict(
+                data_reduce='mean-std',
+                postprocess=_combine_ndim_mean_std,
+                store_trigger=(100, 'iteration'),
+            )),
+        ])
     graph.config_node(
         'g/g2/h2_relu',
         data=dict(
-            data_reduce='overwrite',
             preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
             store_trigger=(1, 'epoch'),
             reset_trigger=(1, 'epoch'),

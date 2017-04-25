@@ -1,6 +1,7 @@
 import contextlib
 import itertools
 import threading
+import six
 from six.moves import urllib
 import sys
 import weakref
@@ -44,30 +45,42 @@ def _get_obj(obj):
 
 
 class DataSeriesConfig(object):
-    def __init__(self, data_reduce=None, preprocess=None,
+    def __init__(self, data_reduce=None,
+                 preprocess=None, postprocess=None,
                  store_trigger=None, reset_trigger=None):
-        if data_reduce == 'average':
-            data_reduce = (
-                (lambda x: x.copy()),
-                (lambda acc,x,i: acc * (i / float(i+1)) + x / (float(i+1))))
-        elif data_reduce == 'overwrite':
-            data_reduce = (
-                (lambda x: x.copy()),
-                (lambda acc,x,i: x.copy()))
 
-        if data_reduce is not None:
-            assert len(data_reduce) == 2
-            assert callable(data_reduce[0])
-            assert callable(data_reduce[1])
+        if isinstance(data_reduce, DataReduction):
+            pass
+        elif data_reduce is None or data_reduce == 'overwrite':
+            data_reduce = OverwriteReduction()
+        elif data_reduce == 'average':
+            data_reduce = AverageReduction()
+        elif data_reduce == 'mean-std':
+            data_reduce = MeanStdReduction()
+        elif (isinstance(data_reduce, (tuple,list)) and
+              len(data_reduce) == 2 and
+              callable(data_reduce[0]) and
+              callable(data_reduce[1])):
+            data_reduce = ReductionByFuncs(
+                init_func=data_reduce[0],
+                reduce_func=data_reduce[1])
+        else:
+            raise ValueError("Invalid value for data_reduce.")
+
+        assert isinstance(data_reduce, DataReduction)
 
         if preprocess is not None:
             assert callable(preprocess)
+
+        if postprocess is not None:
+            assert callable(postprocess)
 
         store_trigger = trigger_module.get_trigger(store_trigger)
         reset_trigger = trigger_module.get_trigger(reset_trigger)
 
         self.data_reduce = data_reduce
         self.preprocess = preprocess
+        self.postprocess = postprocess
         self.store_trigger = store_trigger
         self.reset_trigger = reset_trigger
 
@@ -105,23 +118,94 @@ class GnodeConfig(object):
         return configs
 
 
+class DataReduction(object):
+    def __call__(self, acc, x, i):
+        pass
+
+    def reset(self):
+        pass
+
+    def reduce(self, acc, x, i):
+        """Returns new value"""
+        pass
+
+    def collect(self, acc, n):
+        return acc
+
+
+class ReductionByFuncs(DataReduction):
+    def __init__(self, init_func=None, reduce_func=None):
+        assert init_func is not None
+        assert reduce_func is not None
+        self.init_func = init_func
+        self.reduce_func = reduce_func
+
+    def reduce(self, acc, x, i):
+        if i == 0:
+            return self.init_func(x)
+        else:
+            return self.reduce_func(acc, x, i)
+
+
+class OverwriteReduction(DataReduction):
+    def reduce(self, acc, x, i):
+        return x.copy()
+
+
+class AverageReduction(DataReduction):
+    def reduce(self, acc, x, i):
+        if i == 0:
+            return x.copy()
+        else:
+            return acc * (i / float(i+1)) + x / float(i+1)
+
+class MeanStdReduction(DataReduction):
+    def __init__(self):
+        self._mean = None
+        self._mean2 = None
+
+    def reset(self):
+        self._mean = None
+        self._mean2 = None
+
+    def _std(self):
+        return numpy.sqrt(self._mean2 - self._mean * self._mean)
+
+    def reduce(self, acc, x, i):
+        if i == 0:
+            self._mean = x
+            self._mean2 = x * x
+        else:
+            self._mean = self._mean * (i / float(i+1)) + x / float(i+1)
+            self._mean2 = self._mean2 * (i / float(i+1)) + (x*x) / float(i+1)
+        return (self._mean, self._std())
+
+
 class DataSeries(object):
     def __init__(self, config):
         self._data_list = []
         self._current_data = None
+        self._current_epoch = None
         self._config = config
-        self._copy_on_write = False
         self.sample_count = 0
         self._epoch_to_idx = {}
+        self._temporaries = {}
 
     def get_data(self, index):
+        """If index is None, that means the current unfinished data."""
+
         if index is None:
-            epoch = None
+            # Unfinished data
+            epoch = self._current_epoch
             if self._current_data is not None:
-                data = self._as_array(self._current_data)
+                data = self._as_array_recursive(self._current_data)
+                # Do post-processing on the fly
+                if self._config.postprocess:
+                    data = self._config.postprocess(data, self.sample_count)
             else:
                 data = self._data_list[-1][1]
         else:
+            # Finished and stored data
             assert 0 <= index < len(self._data_list)
             epoch, data = self._data_list[index]
         return epoch, data
@@ -136,31 +220,25 @@ class DataSeries(object):
         config = self._config
 
         # Preparation
-        if self._copy_on_write:
-            if self._current_data is not None:
-                self._current_data = self._current_data.copy()
-            self._copy_on_write = False
+        if config.preprocess:
+            data = config.preprocess(data)
+
+        epoch = trainer.updater.epoch_detail
 
         # Add sample
-        if config.data_reduce is not None:
-            if config.preprocess:
-                data = config.preprocess(data)
-
-            current_data = self._current_data
-            if current_data is None:
-                func_init = config.data_reduce[0]
-                current_data = func_init(data)
-            else:
-                func_reduce = config.data_reduce[1]
-                current_data = func_reduce(current_data, data, self.sample_count)
-            self._current_data = current_data
+        assert ((self.sample_count == 0 and self._current_data is None) or
+                (self.sample_count > 0 and self._current_data is not None))
+        self._current_data = config.data_reduce.reduce(
+            self._current_data, data, self.sample_count)
+        assert self._current_data is not None
+        self._current_epoch = epoch
 
         self.sample_count += 1
 
         # Store data
         if config.store_trigger is not None:
             if config.store_trigger(trainer):
-                self.store_current(trainer.updater.epoch_detail)
+                self.store_current(epoch)
 
         # Reset data
         if config.reset_trigger is not None:
@@ -168,15 +246,31 @@ class DataSeries(object):
                 self.reset_current()
 
     def store_current(self, epoch):
-        data = self._as_array(self._current_data)
+        config = self._config
+        data = config.data_reduce.collect(self._current_data, self.sample_count)
+        data = self._as_array_recursive(data)
+        if config.postprocess:
+            data = config.postprocess(data, self.sample_count)
         self._data_list.append((epoch, data))
 
-        # Mark _current_data as copy-on-write
-        self._copy_on_write = True
-
     def reset_current(self):
+        self._config.data_reduce.reset()
         self._current_data = None
-        self._copy_on_write = False
+        self._current_epoch = None
+        self.sample_count = 0
+
+    def _as_array_recursive(self, data):
+        # TODO: support dict
+        if isinstance(data, _ndarrays):
+            return self._as_array(data)
+        elif isinstance(data, numpy.generic):
+            return data
+        elif isinstance(data, tuple):
+            return tuple([self._as_array_recursive(_) for _ in data])
+        elif isinstance(data, list):
+            return [self._as_array_recursive(_) for _ in data]
+        else:
+            assert False, type(data)
 
     def _as_array(self, data):
         if cuda.available:
@@ -423,21 +517,6 @@ class GraphEdge(object):
     def __repr__(self):
         return '<GraphEdge {:x} i={} from={} to={}>'.format(
             id(self), self.arg_index, self.in_gnode, self.out_gnode)
-
-    def add_data_sample(self, obj, var_config):
-        if isinstance(obj, variable.Variable):
-            data = obj.data
-        elif isinstance(obj, _ndarrays):
-            data = obj
-        else:
-            assert False
-        store_average, = var_config
-        if store_average:
-            data = var.data
-            if self.data_sum is None:
-                self.data_sum = data.copy()
-            else:
-                self.data_sum += data
 
 
 class Graph(object):
@@ -1445,6 +1524,20 @@ def get_obj(path):
     return graph
 
 
+def _ndarray_to_list(data):
+    if isinstance(data, numpy.ndarray):
+        return data.tolist()
+    if isinstance(data, numpy.generic):
+        return data.item()
+    elif isinstance(data, (tuple,list)):
+        return [_ndarray_to_list(_) for _ in data]
+    elif isinstance(data, dict):
+        return {key: _ndarray_to_list(_) for key,_ in data.items()}
+    else:
+        assert data is None or isinstance(data, (float,str) + six.integer_types), type(data)
+        return data
+
+
 def api(api_name, path, query, environ):
     method = environ['REQUEST_METHOD']
     if api_name == 'graph' and method == 'GET':
@@ -1541,19 +1634,53 @@ def api(api_name, path, query, environ):
         return 'application/json', json_data
 
     if api_name == 'data' and method == 'GET':
-        def read_query(key, type=str):
-            return type(query[key][0])
+        def read_query(key, type=str, default=None):
+            if key in query:
+                return type(query[key][0])
+            else:
+                return default
+
+        """
+        data_index:
+             None      ... all data
+             'current' ... latest data
+             int       ... index
+        """
+
         data_name = read_query('name')
-        data_index = read_query('index', int)
-        if data_index == -1:
-            data_index = None
+        data_index = read_query('index')
+        data_type = read_query('type', str, 'json')
 
+        # Get data
         node = get_obj(path)
-        _, arr = node.data_collection[data_name].get_data(data_index)
-
-        if arr is None:
-            json_data = '{}'
+        data_series = node.data_collection[data_name]
+        if data_index is None:
+            # this `epochs` could include `None`
+            epochs = data_series.get_iterations()
+            epoch_list = []
+            data_list = []
+            for i,epoch in enumerate(epochs):
+                data_index_ = i if epoch is not None else None
+                epoch_, data_ = data_series.get_data(data_index_)
+                epoch_list.append(epoch_)
+                data_list.append(data_)
+            data = {
+                'epochs': epoch_list,
+                'data': data_list,
+            }
         else:
+            data_index_ = int(data_index) if data_index != 'current' else None
+            _, data = data_series.get_data(data_index_)
+
+        # Encode data
+        if data is None:
+            response_data = '{}'
+            content_type = 'application/json'
+        elif data_type == 'json':
+            response_data = json.dumps(_ndarray_to_list(data))
+            content_type = 'application/json'
+        elif data_type == 'image':
+            assert isinstance(data, numpy.ndarray) and data.ndim == 2
             import matplotlib
             import io
             dpi = 100
@@ -1563,13 +1690,16 @@ def api(api_name, path, query, environ):
             fig  = matplotlib.pyplot.figure(figsize=figsize, frameon=False)
             ax = fig.add_axes([0, 0, 1, 1])
             ax.axis('off')
-            ax.pcolormesh(arr)
+            ax.pcolormesh(data)
             buf = io.BytesIO()
             fig.savefig(buf, format='png')
             matplotlib.pyplot.close(fig)
-            png_data = buf.getvalue()
+            response_data = buf.getvalue()
+            content_type = 'image/png'
+        else:
+            assert False
 
-        return 'image/png', png_data
+        return content_type, response_data
 
     return 'text/plain', 'Error: Invalid api request: {} method={} path={}'.format(api_name, method, path)
 
