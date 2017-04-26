@@ -134,6 +134,12 @@ def init_graph():
                 data_reduce='mean-std',
                 postprocess=_combine_ndim_mean_std,
                 store_trigger=(100, 'iteration'),
+                reset_trigger=(100, 'iteration'),
+            )),
+            ('percentile', dict(
+                data_reduce='percentile',
+                store_trigger=(100, 'iteration'),
+                reset_trigger=(100, 'iteration'),
             )),
         ])
     graph.config_node(

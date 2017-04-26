@@ -57,6 +57,8 @@ class DataSeriesConfig(object):
             data_reduce = AverageReduction()
         elif data_reduce == 'mean-std':
             data_reduce = MeanStdReduction()
+        elif data_reduce == 'percentile':
+            data_reduce = PercentileReduction()
         elif (isinstance(data_reduce, (tuple,list)) and
               len(data_reduce) == 2 and
               callable(data_reduce[0]) and
@@ -119,9 +121,6 @@ class GnodeConfig(object):
 
 
 class DataReduction(object):
-    def __call__(self, acc, x, i):
-        pass
-
     def reset(self):
         pass
 
@@ -173,12 +172,56 @@ class MeanStdReduction(DataReduction):
 
     def reduce(self, acc, x, i):
         if i == 0:
-            self._mean = x
+            self._mean = x.copy()
             self._mean2 = x * x
         else:
             self._mean = self._mean * (i / float(i+1)) + x / float(i+1)
             self._mean2 = self._mean2 * (i / float(i+1)) + (x*x) / float(i+1)
         return (self._mean, self._std())
+
+
+class PercentileReduction(DataReduction):
+    def __init__(self, k=10000):
+        self._k = k
+        self._n_elms = 0
+
+    def reset(self):
+        self._n_elms = 0
+
+    def reduce(self, acc, x, i):
+        k = self._k
+        n_elms = self._n_elms
+        reservoir = acc
+
+        if i == 0:
+            reservoir = numpy.empty((k,), dtype=x.dtype)
+
+        x_ = x.flat
+
+        # Copy first k elements
+        n_copy = max(0, min(x.size, k - n_elms))
+        if n_copy > 0:
+            reservoir[n_elms:n_elms+n_copy] = x_[0:n_copy]
+            n_elms += n_copy
+
+        # Sample remaining elements with probability 1/(n+1)
+        #  where n = n_elms, n_elms+1, n_elms+2, ...
+        n_sample = x.size - n_copy
+        if n_sample > 0:
+            j = numpy.random.random((n_sample,)) * numpy.arange(n_elms+1, n_elms+1+n_sample)
+            j = j.astype(numpy.int32)
+            taken = j < k
+            taken_idx = numpy.where(taken)
+            reservoir[j[taken_idx]] = x_[taken]
+            n_elms += n_sample
+
+        self._n_elms = n_elms
+
+        return reservoir
+
+    def collect(self, acc, n):
+        reservoir = acc
+        return numpy.percentile(reservoir, numpy.arange(0,110,10))
 
 
 class DataSeries(object):
@@ -189,7 +232,6 @@ class DataSeries(object):
         self._config = config
         self.sample_count = 0
         self._epoch_to_idx = {}
-        self._temporaries = {}
 
     def get_data(self, index):
         """If index is None, that means the current unfinished data."""
@@ -198,7 +240,8 @@ class DataSeries(object):
             # Unfinished data
             epoch = self._current_epoch
             if self._current_data is not None:
-                data = self._as_array_recursive(self._current_data)
+                data = self._config.data_reduce.collect(self._current_data, self.sample_count)
+                data = self._as_array_recursive(data)
                 # Do post-processing on the fly
                 if self._config.postprocess:
                     data = self._config.postprocess(data, self.sample_count)
