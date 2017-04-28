@@ -45,7 +45,7 @@ def _get_obj(obj):
 
 
 class DataSeriesConfig(object):
-    def __init__(self, data_reduce=None,
+    def __init__(self, enable=True, data_reduce=None,
                  preprocess=None, postprocess=None,
                  store_trigger=None, reset_trigger=None):
 
@@ -80,6 +80,7 @@ class DataSeriesConfig(object):
         store_trigger = trigger_module.get_trigger(store_trigger)
         reset_trigger = trigger_module.get_trigger(reset_trigger)
 
+        self.enable = enable
         self.data_reduce = data_reduce
         self.preprocess = preprocess
         self.postprocess = postprocess
@@ -157,6 +158,7 @@ class AverageReduction(DataReduction):
             return x.copy()
         else:
             return acc * (i / float(i+1)) + x / float(i+1)
+
 
 class MeanStdReduction(DataReduction):
     def __init__(self):
@@ -334,7 +336,8 @@ class DataCollection(object):
         return name in self._data_series_dict
 
     def get_names(self):
-        return self._data_series_dict.keys()
+        return [name for name in self._data_series_dict.keys()
+                if self._data_series_dict[name].config.enable]
 
     def get_summary(self):
         summary = {}
@@ -478,7 +481,6 @@ class VariableGnode(Gnode):
 
         self.data_collection = DataCollection()
 
-
     @classmethod
     def get_extra_clue(cls, var, tag):
         assert isinstance(var, (variable.VariableNode,) + _ndarrays)
@@ -500,7 +502,8 @@ class VariableGnode(Gnode):
     def _prepare_data_collection(self, data_series_configs):
         assert isinstance(data_series_configs, dict)
         for name, config in data_series_configs.items():
-            self.data_collection.ensure_data_series_prepared(name, config)
+            if config.enable:
+                self.data_collection.ensure_data_series_prepared(name, config)
 
     def add_data_sample(self, data, trainer):
         assert isinstance(data, _ndarrays)
