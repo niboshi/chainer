@@ -249,7 +249,8 @@ class DataSeries(object):
                 data = self._data_list[-1][1]
         else:
             # Finished and stored data
-            assert 0 <= index < len(self._data_list)
+            if not (0 <= index < len(self._data_list)):
+                raise IndexError()
             epoch, data = self._data_list[index]
         return epoch, data
 
@@ -328,6 +329,9 @@ class DataCollection(object):
 
     def __getitem__(self, name):
         return self._data_series_dict[name]
+
+    def __contains__(self, name):
+        return name in self._data_series_dict
 
     def get_names(self):
         return self._data_series_dict.keys()
@@ -1516,6 +1520,11 @@ class GraphSummary(extension.Extension):
 
 server_graph = None
 
+
+class ErrorResponse(Exception):
+    pass
+
+
 def _do_run_server():
     werkzeug.serving.run_simple('localhost', 6007, graph_app)
 
@@ -1559,10 +1568,10 @@ def get_obj(path):
         node = graph.get_node(tag)
         if node is not None:
             if len(path_list) > 0:
-                raise RuntimeError("Invalid object path: {}".format(path))
+                raise KeyError("Invalid object path: {}".format(path))
             return node
 
-        raise RuntimeError("Object not found: {}".format(path))
+        raise KeyError("Object not found: {}".format(path))
 
     return graph
 
@@ -1677,9 +1686,12 @@ def api(api_name, path, query, environ):
         return 'application/json', json_data
 
     if api_name == 'data' and method == 'GET':
-        def read_query(key, type=str, default=None):
+        required = object()
+        def read_query(key, type=str, default=required):
             if key in query:
                 return type(query[key][0])
+            elif default is required:
+                raise ErrorResponse('Required query is missing: {}'.format(key))
             else:
                 return default
 
@@ -1691,18 +1703,25 @@ def api(api_name, path, query, environ):
         """
 
         data_name = read_query('name')
-        data_index = read_query('index')
-        data_type = read_query('type', str, 'json')
+        data_index = read_query('index', default=None)
+        data_type = read_query('type', default='json')
 
         # Get data
-        node = get_obj(path)
+        try:
+            node = get_obj(path)
+        except KeyError:
+            raise ErrorResponse('Invalid query path: {}'.format(path))
+
+        if data_name not in node.data_collection:
+            raise ErrorResponse('Invalid data name: {}'.format(data_name))
         data_series = node.data_collection[data_name]
+
         if data_index is None:
             # this `epochs` could include `None`
             epochs = data_series.get_iterations()
             epoch_list = []
             data_list = []
-            for i,epoch in enumerate(epochs):
+            for i, epoch in enumerate(epochs):
                 data_index_ = i if epoch is not None else None
                 epoch_, data_ = data_series.get_data(data_index_)
                 epoch_list.append(epoch_)
@@ -1713,12 +1732,15 @@ def api(api_name, path, query, environ):
             }
         else:
             data_index_ = int(data_index) if data_index != 'current' else None
-            _, data = data_series.get_data(data_index_)
+
+            try:
+                _, data = data_series.get_data(data_index_)
+            except IndexError as e:
+                raise ErrorResponse('Invalid data index: {}'.format(data_index))
 
         # Encode data
         if data is None:
-            response_data = '{}'
-            content_type = 'application/json'
+            raise ErrorResponse('No data is available.')
         elif data_type == 'json':
             response_data = json.dumps(_ndarray_to_list(data))
             content_type = 'application/json'
@@ -1730,7 +1752,7 @@ def api(api_name, path, query, environ):
             width = 100
             height = 100
             figsize = (width / dpi, height / dpi)
-            fig  = matplotlib.pyplot.figure(figsize=figsize, frameon=False)
+            fig = matplotlib.pyplot.figure(figsize=figsize, frameon=False)
             ax = fig.add_axes([0, 0, 1, 1])
             ax.axis('off')
             ax.pcolormesh(data)
@@ -1740,11 +1762,12 @@ def api(api_name, path, query, environ):
             response_data = buf.getvalue()
             content_type = 'image/png'
         else:
-            assert False
+            raise ErrorResponse('Invalid data type: {}'.format(data_type))
 
         return content_type, response_data
 
-    return 'text/plain', 'Error: Invalid api request: {} method={} path={}'.format(api_name, method, path)
+    raise ErrorResponse('Invalid api request: {} method={} path={}'.format(
+        api_name, method, path))
 
 
 def pop_path(path):
@@ -1754,7 +1777,7 @@ def pop_path(path):
     else:
         return split[0], split[1]
 
-#@werkzeug.wrappers.Request.application
+
 def graph_app(environ, start_response):
     status = 200
 
@@ -1765,7 +1788,15 @@ def graph_app(environ, start_response):
 
     if root_path == 'api':
         api_name, path = pop_path(path)
-        content_type, data = api(api_name, path, query, environ)
+
+        try:
+            content_type, data = api(api_name, path, query, environ)
+        except ErrorResponse as e:
+            content_type = 'application/json'
+            data = json.dumps({
+                'error': str(e),
+            })
+
         if isinstance(data, str):
             data = data.encode('utf-8')
     else:
