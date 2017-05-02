@@ -1556,7 +1556,7 @@ def get_obj(path):
     graph_name = path_list.pop(0)
     graph = server_graph
     if graph_name != graph.tag:
-        raise RuntimeError()
+        raise KeyError("Invalid root graph name: {}".format(graph_name))
 
     while len(path_list) > 0:
         tag = path_list.pop(0)
