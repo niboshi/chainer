@@ -91,61 +91,38 @@ class VGG(chainer.Chain):
 
         # 64 channel blocks:
         with graph_summary.graph([x], 'vgg_block1') as g:
-            g.config_node(x, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block1_1(x)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.3)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block1_2(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.max_pooling_2d(h, ksize=2, stride=2)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             g.set_output([h])
 
         # 128 channel blocks:
         with graph_summary.graph([h], 'vgg_block2') as g:
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block2_1(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.4)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block2_2(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.max_pooling_2d(h, ksize=2, stride=2)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             g.set_output([h])
 
         # 256 channel blocks:
         with graph_summary.graph([h], 'vgg_block3') as g:
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block3_1(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.4)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block3_2(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.4)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block3_3(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.max_pooling_2d(h, ksize=2, stride=2)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             g.set_output([h])
 
         # 512 channel blocks:
         with graph_summary.graph([h], 'vgg_block4') as g:
             h = self.block4_1(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.4)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block4_2(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.dropout(h, ratio=0.4)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = self.block4_3(h)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             h = F.max_pooling_2d(h, ksize=2, stride=2)
-            g.config_node(h, data_reduce='average', preprocess=lambda _: _.mean(axis=(0,1)))
             g.set_output([h])
 
         # 512 channel blocks:

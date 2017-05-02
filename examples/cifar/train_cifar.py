@@ -16,7 +16,7 @@ import matplotlib
 matplotlib.use('Agg')
 
 
-graph = graph_summary.Graph('graph')
+graph = graph_summary.Graph('root_graph')
 
 class TestModeEvaluator(extensions.Evaluator):
 

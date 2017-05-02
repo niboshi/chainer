@@ -64,20 +64,7 @@ class MLP(chainer.Chain):
                 h = F.sigmoid(h)
                 g.set_tag(h, 'h1_sigmoid')
 
-            g.config_node(h, data=dict(
-                data_reduce='average',
-                preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-                store_trigger=(1, 'epoch'),
-                reset_trigger=(1, 'epoch'),
-            ))
-
             with graph_summary.graph([h], 'g2') as g2:
-                g2.config_node(h, data=dict(
-                    data_reduce='average',
-                    preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-                    store_trigger=(1, 'epoch'),
-                    reset_trigger=(1, 'epoch'),
-                ))
                 if iii % 2 == 0:
                     h = F.relu(self.l2(h))
                     g2.set_tag(h, 'h2_relu')
@@ -117,54 +104,46 @@ def _combine_ndim_mean_std(mean_std, n):
     return (total_mean, total_std)
 
 def init_graph():
+    data_config_set = [
+        ('latest', dict(
+            preprocess=lambda x: x[-1,:].reshape((25, 40)),
+        )),
+        ('average', dict(
+            data_reduce='average',
+            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
+            store_trigger=(1, 'epoch'),
+            reset_trigger=(1, 'epoch'),
+        )),
+        ('mean-std', dict(
+            data_reduce='mean-std',
+            postprocess=_combine_ndim_mean_std,
+            store_trigger=(100, 'iteration'),
+            reset_trigger=(100, 'iteration'),
+        )),
+        ('percentile', dict(
+            data_reduce='percentile',
+            store_trigger=(100, 'iteration'),
+            reset_trigger=(100, 'iteration'),
+        )),
+    ]
+
+
     graph = graph_summary.Graph('root_graph')
     graph.config_node(
         'g/hh',
-        data=[
-            ('latest', dict(
-                preprocess=lambda x: x[-1,:].reshape((25, 40)),
-            )),
-            ('average', dict(
-                data_reduce='average',
-                preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-                store_trigger=(1, 'epoch'),
-                reset_trigger=(1, 'epoch'),
-            )),
-            ('mean-std', dict(
-                data_reduce='mean-std',
-                postprocess=_combine_ndim_mean_std,
-                store_trigger=(100, 'iteration'),
-                reset_trigger=(100, 'iteration'),
-            )),
-            ('percentile', dict(
-                data_reduce='percentile',
-                store_trigger=(100, 'iteration'),
-                reset_trigger=(100, 'iteration'),
-            )),
-        ])
+        data=data_config_set)
     graph.config_node(
         'g/g2/h2_relu',
-        data=dict(
-            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-            store_trigger=(1, 'epoch'),
-            reset_trigger=(1, 'epoch'),
-        ))
+        data=data_config_set)
     graph.config_node(
         'g/g2/h2_sigmoid',
-        data=dict(
-            data_reduce='average',
-            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-            store_trigger=(1, 'epoch'),
-            reset_trigger=(1, 'epoch'),
-        ))
+        data=data_config_set)
     graph.config_node(
-        'g/g2/h2_sigmoid',
-        data=[('image', dict(
-            data_reduce='average',
-            preprocess=lambda x: x.mean(axis=0).reshape((25, 40)),
-            store_trigger=(1, 'epoch'),
-            reset_trigger=(1, 'epoch'),
-        ))])
+        'g/h1_relu',
+        data=data_config_set)
+    graph.config_node(
+        'g/h1_sigmoid',
+        data=data_config_set)
     return graph
 
 
@@ -258,7 +237,7 @@ def main():
     """
 
     # Print a progress bar to stdout
-    trainer.extend(extensions.ProgressBar())
+    #trainer.extend(extensions.ProgressBar())
 
     if args.resume:
         # Resume from a snapshot
