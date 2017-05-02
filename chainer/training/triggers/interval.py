@@ -45,4 +45,6 @@ class IntervalTrigger(object):
             return prev != self.count
         else:
             iteration = updater.iteration
-            return iteration > 0 and iteration % self.period == 0
+            prev = self.count
+            self.count = iteration // self.period
+            return prev != self.count
