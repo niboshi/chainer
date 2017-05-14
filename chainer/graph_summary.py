@@ -1261,7 +1261,10 @@ class GraphContext(object):
 
         subgraph_tag = subgraph.tag
         assert isinstance(subgraph_tag, str)
-        assert subgraph_tag not in self.subgraph_map
+        if subgraph_tag in self.subgraph_map:
+            raise RuntimeError('Duplicated subgraph tag (\'{}\') appears in '
+                               'a single subgraph (\'{}\')'.format(
+                                   subgraph_tag, self.tag))
         input_objs = [_get_obj(_) for _ in input_variables]
         self.subgraph_map[subgraph_tag] = (input_objs, output_variables)
 
