@@ -37,7 +37,7 @@ class MLP(chainer.Chain):
             self.l2 = L.Linear(None, n_units)  # n_units -> n_units
             self.l3 = L.Linear(None, n_out)  # n_units -> n_out
 
-    def __call__(self, x):
+    def __call_link__(self, x):
         global iii
 
         with graph_summary.graph([x], 'g') as g:
@@ -130,19 +130,19 @@ def init_graph():
 
     graph = graph_summary.Graph('root_graph')
     graph.config_node(
-        'g/hh',
+        'predictor/g/hh',
         data=data_config_set)
     graph.config_node(
-        'g/g2/h2_relu',
+        'predictor/g/g2/h2_relu',
         data=data_config_set)
     graph.config_node(
-        'g/g2/h2_sigmoid',
+        'predictor/g/g2/h2_sigmoid',
         data=data_config_set)
     graph.config_node(
-        'g/h1_relu',
+        'predictor/g/h1_relu',
         data=data_config_set)
     graph.config_node(
-        'g/h1_sigmoid',
+        'predictor/g/h1_sigmoid',
         data=data_config_set)
     return graph
 

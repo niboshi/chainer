@@ -9,8 +9,10 @@ import numpy
 from chainer import cuda
 from chainer import variable
 from chainer import function
-from chainer.training import trainer as trainer_module
-from chainer.training import trigger as trigger_module
+from chainer.training import util as trigger_util
+
+
+DEBUG = False
 
 
 if cuda.available:
@@ -26,7 +28,7 @@ def get_name(obj):
         return None
     elif isinstance(obj, function.Function):
         return type(obj).__name__
-    elif isinstance(obj, Graph):
+    elif isinstance(obj, (SubgraphObj, Graph)):
         return None
     else:
         assert False
@@ -72,8 +74,8 @@ class DataSeriesConfig(object):
         if postprocess is not None:
             assert callable(postprocess)
 
-        store_trigger = trigger_module.get_trigger(store_trigger)
-        reset_trigger = trigger_module.get_trigger(reset_trigger)
+        store_trigger = trigger_util.get_trigger(store_trigger)
+        reset_trigger = trigger_util.get_trigger(reset_trigger)
 
         self.enable = enable
         self.data_reduce = data_reduce
@@ -397,7 +399,7 @@ class Gnode(object):
             return 'variable'
         if obj_type in _ndarrays:
             return 'variable'
-        elif obj_type is Graph:
+        elif obj_type in (Graph, SubgraphObj):
             return 'subgraph'
         elif issubclass(obj_type, function.Function):
             return 'function'
@@ -406,7 +408,7 @@ class Gnode(object):
 
     @classmethod
     def from_obj(cls, obj, tag, metatag):
-        assert not isinstance(obj, Graph)
+        assert not isinstance(obj, SubgraphObj)
         if isinstance(obj, (variable.VariableNode,) + _ndarrays):
             return VariableGnode(obj, tag, metatag)
         elif isinstance(obj, function.Function):
@@ -427,7 +429,7 @@ class Gnode(object):
             extra_clue = VariableGnode.get_extra_clue(obj, tag)
         elif isinstance(obj, function.Function):
             extra_clue = FunctionGnode.get_extra_clue(obj, tag)
-        elif isinstance(obj, Graph):
+        elif isinstance(obj, SubgraphObj):
             extra_clue = cls.get_graph_clue(obj, tag)
         else:
             assert False
@@ -821,6 +823,15 @@ class Graph(object):
         putline('}')
 
 
+class SubgraphObj:
+    def __init__(self, graph, input_variables, output_variables, metatag):
+        self.graph = graph
+        self.input_objs = [_get_obj(_) for _ in input_variables]
+        self.output_objs = output_variables
+        self.tag = graph.tag
+        self.metatag = metatag
+
+
 class MatchConfig:
     def __init__(self, can_create_edge=False, can_create_node=False, max_create=0):
         self.can_create_edge = can_create_edge
@@ -876,7 +887,7 @@ class MatchState:
         self.good = True
 
     def __enter__(self):
-        if not isinstance(self.obj, Graph):
+        if not isinstance(self.obj, SubgraphObj):
             if id(self.obj) in self.visited_objs:
                 self.good = False
 
@@ -968,13 +979,17 @@ class GraphContext(object):
         # chainer.VariableNode -> chainer.Variable
         self.variable_node_map = {}
 
-        self.subgraph_map = {} # subgraph tag -> (input variables, output variables)
+        # id(ndarray) => ndarray
+        self.root_variable_map = {}
+
         self.subgraph_output_map = {} # output variable -> (subgraph, index, gnode)
 
         # Submit input variables to the graph
         for v in inputs:
             if isinstance(v, variable.Variable):
                 self._memorize_variable(v)
+            elif isinstance(v, _ndarrays):
+                self.root_variable_map[id(v)] = v
 
     def _cleanup_pass(self):
         # TODO: These variables and related operations could be capsulated into
@@ -988,7 +1003,6 @@ class GraphContext(object):
         del self.variable_map
         del self.variable_map2
         del self.variable_node_map
-        del self.subgraph_map
         del self.subgraph_output_map
         del self.trainer
 
@@ -1096,7 +1110,8 @@ class GraphContext(object):
         ))
 
     def debug(self, s):
-        pass #print("{}: {}".format(self.tag, s))
+        if DEBUG:
+            print("{}: {}".format(self.tag, s))
 
     def _find_matches_partial_tree(self, obj, prev_mnode, state, config):
         """ Returns: [] of MatchSolution
@@ -1131,53 +1146,52 @@ class GraphContext(object):
         else:
             mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
 
+            debug('Examining node obj: {}'.format(type(obj)))
+
             if isinstance(obj, variable.VariableNode):
                 func = obj.creator
                 if func is None:
-                    # This is an automatically-created variable.
+                    # obj is a root variable
                     mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
                     debug("Reached floating variable: {}".format(obj))
                     return [MatchSolution([], [mnode])], False
 
                 subgraph_tuple = self.subgraph_output_map.get(id(obj))
                 if subgraph_tuple is not None:
-                    #subgraph_tag, index = subgraph_tuple
+                    # obj is an output variable of a subgraph
                     subgraph, index = subgraph_tuple
-                    # This is an output variable of some subgraph
                     inputs = [subgraph]
                     arg_indices = [index]
 
                 else:
-                    # Ordinary variable
+                    # obj is a non-root variable
                     inputs = [func]
                     arg_indices = [i for i,_ in enumerate(func.outputs) if _() is obj]
 
             elif isinstance(obj, _ndarrays):
-                # This is an automatically-created variable.
+                # obj is a root variable (array)
                 mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
                 debug("Reached floating variable: {}".format(id(obj)))
                 return [MatchSolution([], [mnode])], False
 
             elif isinstance(obj, function.Function):
+                # obj is a function
                 inputs = obj.inputs
                 debug("FUNC: {}".format(type(obj)))
                 debug("  : {}".format(' '.join('{}'.format(type(_)) for _ in inputs)))
                 arg_indices = list(range(len(inputs)))
 
-            elif isinstance(obj, Graph):
-                assert obj.input_nodes is not None
-                assert obj.output_nodes is not None
+            elif isinstance(obj, SubgraphObj):
+                # obj is a subgraph
                 subgraph_tag = obj.tag
                 assert isinstance(subgraph_tag, str)
-
-                inputs, _ = self.subgraph_map[subgraph_tag]
-                _ = None
+                inputs = obj.input_objs
 
                 arg_indices = list(range(len(inputs)))
             else:
                 assert False
 
-            assert all(isinstance(_, (variable.VariableNode, function.Function, Graph) + _ndarrays) for _ in inputs)
+            assert all(isinstance(_, (variable.VariableNode, function.Function, SubgraphObj) + _ndarrays) for _ in inputs)
             assert len(arg_indices) == len(inputs)
 
 
@@ -1185,56 +1199,60 @@ class GraphContext(object):
             in_arg_solutions = [[] for _ in range(len(inputs))]
             hit_creation_limit = False
 
-            for in_obj, in_arg_index in zip(inputs, arg_indices):
+            for i, (in_obj, in_arg_index) in enumerate(zip(inputs, arg_indices)):
+                debug('input {}: {}'.format(i, type(in_obj)))
                 if isinstance(in_obj, (variable.VariableNode,) + _ndarrays):
                     in_tag, in_metatag = self._get_variable_tags(in_obj)
-                elif isinstance(in_obj, Graph):
+                elif isinstance(in_obj, SubgraphObj):
                     in_tag = in_obj.tag
-                    in_metatag = None
+                    in_metatag = in_obj.metatag
                 else:
                     in_tag = None
                     in_metatag = None
 
-                debug('FIND MATCH: {} {} {}'.format(in_tag, in_metatag, in_arg_index))
+                debug('in_tag={} in_metatag={} in_arg_index={}'.format(in_tag, in_metatag, in_arg_index))
 
                 # (1) Examine known input gnodes
+                debug('(1)')
                 for in_gnode in gnode.get_compatible_in_gnodes(in_obj, in_tag, in_metatag, in_arg_index):
+                    debug('Compatible node: {}'.format(in_gnode))
                     with MatchState(state, in_gnode, in_arg_index, False, False, in_obj) as st:
                         if st.good:
                             sols, hit_cl = rec(in_obj, mnode, st, config)
-                            in_arg_solutions[in_arg_index] += sols
+                            in_arg_solutions[i] += sols
                             hit_creation_limit = hit_creation_limit or hit_cl
 
-                if len(in_arg_solutions[in_arg_index]) == 0:
+                if len(in_arg_solutions[i]) == 0:
                     # (2) Examine compatible gnodes
-                    if config.can_create_edge and not (in_tag is None and in_metatag is None):
+                    if config.can_create_edge:
                         debug('(2)')
                         for in_gnode in self.graph.get_compatible_nodes(in_obj, in_tag, in_metatag):
                             with MatchState(state, in_gnode, in_arg_index, True, False, in_obj) as st:
                                 if st.good:
                                     sols, hit_cl = rec(in_obj, mnode, st, config)
-                                    in_arg_solutions[in_arg_index] += sols
+                                    in_arg_solutions[i] += sols
                                     hit_creation_limit = hit_creation_limit or hit_cl
 
                     # (3) Examine new gnode
                     to_create_node = (
                         config.can_create_node and
-                        (not isinstance(in_obj, Graph)))
+                        (not isinstance(in_obj, SubgraphObj)))
 
                     if to_create_node:
+                        debug('(3)')
                         in_gnode = Gnode.from_obj(in_obj, in_tag, in_metatag)
                         debug("create: {} {}".format(in_tag, in_obj))
-                        debug("create2: {}".format(self.variable_map))
-                        debug("create3: {}".format(in_gnode.clue))
+                        debug("create: {}".format(self.variable_map))
+                        debug("create: {}".format(in_gnode.clue))
                         with MatchState(state, in_gnode, in_arg_index, True, True, in_obj) as st:
                             if st.good:
                                 sols, hit_cl = rec(in_obj, mnode, st, config)
-                                in_arg_solutions[in_arg_index] += sols
+                                in_arg_solutions[i] += sols
                                 hit_creation_limit = hit_creation_limit or hit_cl
 
                     # If solution cannnot be found for any of input arguments,
                     # this node all in all is a failure.
-                    if len(in_arg_solutions[in_arg_index]) == 0:
+                    if len(in_arg_solutions[i]) == 0:
                         debug("No solution")
                         return [], hit_creation_limit
 
@@ -1251,20 +1269,16 @@ class GraphContext(object):
 
             return solutions, hit_creation_limit
 
-    def submit_subgraph(self, subgraph, input_variables, output_variables):
+    def submit_subgraph(self, subgraph, input_variables, output_variables, metatag=None):
         self.debug("submit_subgraph: {}".format(subgraph.tag))
+
+        obj = SubgraphObj(subgraph, input_variables, output_variables, metatag)
 
         subgraph_tag = subgraph.tag
         assert isinstance(subgraph_tag, str)
-        if subgraph_tag in self.subgraph_map:
-            raise RuntimeError('Duplicated subgraph tag (\'{}\') appears in '
-                               'a single subgraph (\'{}\')'.format(
-                                   subgraph_tag, self.tag))
-        input_objs = [_get_obj(_) for _ in input_variables]
-        self.subgraph_map[subgraph_tag] = (input_objs, output_variables)
 
         for i,out_var in enumerate(output_variables):
-            self.subgraph_output_map[id(_get_obj(out_var))] = (subgraph, i)
+            self.subgraph_output_map[id(_get_obj(out_var))] = (obj, i)
 
     def submit_graph(self):
         # Submit input variables to the graph
@@ -1380,12 +1394,15 @@ class GraphContext(object):
         # Node statistics
         for mnode in mnodes:
             gnode = mnode.gnode
-            out_edge = mnode.out_edge
 
             if isinstance(mnode.obj, (variable.VariableNode,) + _ndarrays):
                 if gnode.node_config is not None:
                     if isinstance(mnode.obj, variable.VariableNode):
-                        data = self.variable_node_map[id(mnode.obj)].data
+                        var = self.variable_node_map.get(id(mnode.obj))
+                        if var is not None:
+                            data = var.data
+                        else:
+                            data = self.root_variable_map[id(mnode.obj.data)]
                     else:
                         data = mnode.obj
                     self.debug('Add data sample: {}'.format(gnode.tag))
@@ -1408,7 +1425,6 @@ class DummyGraphContext(object):
 
 @contextlib.contextmanager
 def root_graph(input_variables, graph, trainer=None, context=None):
-    assert trainer is None or isinstance(trainer, trainer_module.Trainer)
     assert context is None or isinstance(context, GraphContext)
     current_thread = threading.current_thread()
 
@@ -1429,10 +1445,11 @@ def root_graph(input_variables, graph, trainer=None, context=None):
 
 
 class graph(object):
-    def __init__(self, input_variables, tag, enable=True):
+    def __init__(self, input_variables, tag, metatag=None, enable=True):
         assert isinstance(tag, str)
         self.input_variables = input_variables
         self.tag = tag
+        self.metatag = metatag
         self.enable = enable
 
     def cleanup(self):
@@ -1480,7 +1497,8 @@ class graph(object):
                 outer_context.submit_subgraph(
                     graph,
                     input_variables,
-                    [v for v,_,_ in context.output_variables])
+                    [v for v,_,_ in context.output_variables],
+                    self.metatag)
 
                 if not context._closed:
                     raise RuntimeError(

@@ -139,6 +139,17 @@ class Link(object):
             shape, dtype = _ensure_shape_dtype(value)
             self.add_param(name, shape, dtype=dtype)
 
+    def __call__(self, *inputs):
+        from chainer._graph_summary._core import graph
+
+        tag = self.name
+        if tag is None:
+            tag = self.__class__.__name__.lower()
+        with graph(inputs, tag) as g:
+            y = self.__call_link__(*inputs)
+            g.set_output([y])
+            return y
+
     @property
     def xp(self):
         """Array module for this link.
