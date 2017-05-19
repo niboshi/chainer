@@ -481,7 +481,7 @@ class VariableGnode(Gnode):
     @classmethod
     def get_extra_clue(cls, var, tag):
         assert isinstance(var, (variable.VariableNode,) + _ndarrays)
-        return (var.shape, var.dtype, var.name if isinstance(var, variable.VariableNode) else None)
+        return (var.shape, var.dtype, var.name if isinstance(var, (variable.Variable, variable.VariableNode)) else None)
 
     def __repr__(self):
         name = self.__class__.__name__
@@ -642,14 +642,26 @@ class Graph(object):
         return self.node_map.get(tag)
 
     def submit_outputs(self, output_variables):
+        assert any(_ is not None for _ in output_variables)
+        self.debug('submit_outputs: {}'.format(output_variables))
+
         if self.output_nodes is None:
-            self.output_nodes = []
-            for i,(obj, tag, metatag) in enumerate(output_variables):
-                obj_ = _get_obj(obj)
+            self.output_nodes = [None] * len(output_variables)
+
+        for i,(obj, tag, metatag) in enumerate(output_variables):
+            gnode = self.output_nodes[i]
+            if gnode is not None:
+                if gnode.tag != tag:
+                    raise RuntimeError("Inconsistent tag of output variable ({} -> {}) between passes".format(gnode.tag, tag))
+                continue
+
+            obj_ = _get_obj(obj)
+            gnode = None if tag is None else self.find_node(tag)
+            if gnode is None:
                 gnode = Gnode.from_obj(obj_, tag, metatag)
                 self._add_node(gnode)
 
-                self.output_nodes.append(gnode)
+            self.output_nodes[i] = gnode
 
         assert len(self.output_nodes) == len(output_variables)
 
@@ -758,7 +770,8 @@ class Graph(object):
                     assert any(_.in_gnode == node for _ in out_gnode.in_edges)
 
     def debug(self, s):
-        pass
+        if DEBUG:
+            print('{}: {}'.format(self.tag, s))
 
     def debug_dump(self, out=None):
         if out is None:
@@ -769,7 +782,7 @@ class Graph(object):
             out.write('\n')
 
         def debug(s):
-            self.debug(s)
+            self.debug("  " + s)
 
         debug("---")
         putline('digraph graphname {rankdir=TB;')
@@ -916,6 +929,10 @@ class MatchSolution:
         self.input_nodes = input_nodes or []
         self.floating_nodes = floating_nodes or []
 
+    def __str__(self):
+        return '<MatchSolution len(input_nodes)={} len(floating_nodes)={}>'.format(
+            len(self.input_nodes), len(self.floating_nodes))
+
     def merge(self, other):
         assert isinstance(other, MatchSolution)
         self.input_nodes += other.input_nodes
@@ -967,11 +984,10 @@ class GraphContext(object):
         self.input_variable_set = set([id(_get_obj(_)) for _ in inputs])
 
         # chainer.VariableNode -> tag, metatag
-        input_metatags = ['$i{}'.format(i) for i in range(len(inputs))]
         self.variable_map = {}
         for i,v in enumerate(inputs):
             obj_ = _get_obj(v)
-            self.variable_map[id(obj_)] = (None, input_metatags[i])
+            self.variable_map[id(obj_)] = (None, None)
 
         # tag -> chainer.VariableNode
         self.variable_map2 = {}
@@ -1011,12 +1027,15 @@ class GraphContext(object):
         assert not self._closed
         output_variables = []
 
-        output_metatags = ['$o{}'.format(i) for i in range(len(outputs))]
-
-        for var,metatag in zip(outputs, output_metatags):
+        for i,var in enumerate(outputs):
             obj_ = _get_obj(var)
-            tag, metatag_ = self._get_variable_tags(var)
-            assert metatag_ is None
+            tag, metatag = self._get_variable_tags(var)
+            assert metatag is None
+
+            # If the output variable is not tagged,
+            # put a metatag to avoid creating loop connection to this variable.
+            if tag is None:
+                metatag = '$o{}'.format(i)
 
             self.variable_map[id(obj_)] = (tag, metatag)
             output_variables.append((var, tag, metatag))
@@ -1224,7 +1243,11 @@ class GraphContext(object):
 
                 if len(in_arg_solutions[i]) == 0:
                     # (2) Examine compatible gnodes
-                    if config.can_create_edge:
+                    to_create_edge = (
+                        config.can_create_edge and
+                        not isinstance(in_obj, function.Function))
+
+                    if to_create_edge:
                         debug('(2)')
                         for in_gnode in self.graph.get_compatible_nodes(in_obj, in_tag, in_metatag):
                             with MatchState(state, in_gnode, in_arg_index, True, False, in_obj) as st:
@@ -1283,10 +1306,17 @@ class GraphContext(object):
     def submit_graph(self):
         # Submit input variables to the graph
         input_tuples = []
-        for v in self.input_variables:
-            obj_ = _get_obj(v)
-            tag, metatag = self.variable_map[id(obj_)]
-            input_tuples.append((v, tag, metatag))
+        for i,var in enumerate(self.input_variables):
+            tag, metatag = self._get_variable_tags(var)
+
+            # If the input variable is not tagged,
+            # put a metatag to avoid creating loop connection to this variable.
+            if metatag is None and tag is None:
+                metatag = '$i{}'.format(i)
+
+            obj = _get_obj(var)
+            self.variable_map[id(obj)] = (tag, metatag)
+            input_tuples.append((var, tag, metatag))
 
         self.graph.submit_inputs(input_tuples)
 

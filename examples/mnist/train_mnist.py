@@ -67,14 +67,8 @@ class MLP(chainer.Chain):
             with graph_summary.graph([h], 'g2') as g2:
                 if iii % 2 == 0:
                     h = F.relu(self.l2(h))
-                    g2.set_tag(h, 'h2_relu')
                 else:
                     h = F.sigmoid(self.l2(h))
-                    g2.set_tag(h, 'h2_sigmoid')
-
-                # output variables can't have tags (currently)...
-                # This dummy function is the workaround.
-                h = h + 0
 
                 g2.set_output([h])
 
