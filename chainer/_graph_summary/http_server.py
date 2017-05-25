@@ -102,6 +102,9 @@ def api(api_name, path, query, environ):
             # TODO: Should not return object id
 
             for node in graph.nodes:
+                if node.is_placeholder:
+                    continue
+
                 d_node = {
                     'id': id(node),
                 }
@@ -156,6 +159,10 @@ def api(api_name, path, query, environ):
                 #
                 nodes.append(d_node)
             for edge in graph.edges:
+                if edge.in_gnode.is_placeholder:
+                    continue
+                if edge.out_gnode.is_placeholder:
+                    continue
                 d_edge = {
                     'source': id(edge.in_gnode),
                     'target': id(edge.out_gnode),
@@ -167,13 +174,16 @@ def api(api_name, path, query, environ):
         finally:
             graph.unlock()
 
+        input_nodes = [None if _ is None or _.is_placeholder else id(_)  for _ in graph.input_nodes]
+        output_nodes = [None if _ is None or _.is_placeholder else id(_)  for _ in graph.output_nodes]
+
         data = {
             'tag': graph.tag,
             'path': path,
             'nodes': nodes,
             'edges': edges,
-            'input_variables': [id(_) for _ in graph.input_nodes],
-            'output_variables': [id(_) for _ in graph.output_nodes],
+            'input_variables': input_nodes,
+            'output_variables': output_nodes,
         }
         json_data = json.dumps(data)
         return 'application/json', json_data

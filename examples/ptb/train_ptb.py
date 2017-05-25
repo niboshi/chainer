@@ -13,6 +13,7 @@ import numpy as np
 
 import chainer
 import chainer.functions as F
+from chainer import graph_summary
 import chainer.links as L
 from chainer import training
 from chainer.training import extensions
@@ -36,7 +37,7 @@ class RNNForLM(chainer.Chain):
         self.l1.reset_state()
         self.l2.reset_state()
 
-    def __call__(self, x):
+    def __call_link__(self, x):
         h0 = self.embed(x)
         h1 = self.l1(F.dropout(h0))
         h2 = self.l2(F.dropout(h1))
@@ -228,6 +229,11 @@ def main():
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)
 
+    graph = graph_summary.Graph('root_graph')
+    trainer.extend(graph_summary.GraphSummary(graph, ['main/loss']))
+
+    print("Starting graph server")
+    graph_summary.run_server(graph, async=True)
     trainer.run()
 
     # Evaluate the final model
@@ -242,4 +248,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        import pdb
+        pdb.post_mortem()

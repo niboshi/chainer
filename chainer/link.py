@@ -145,9 +145,9 @@ class Link(object):
         tag = self.name
         if tag is None:
             tag = self.__class__.__name__.lower()
-        with graph(inputs, tag) as g:
+        with graph(inputs + self.get_state(), tag) as g:
             y = self.__call_link__(*inputs)
-            g.set_output([y])
+            g.set_output((y,) + self.get_state())
             return y
 
     @property
@@ -566,6 +566,9 @@ Assign a Parameter object directly to an attribute within a \
                     param.data.set(numpy.asarray(data))
         for name in self._persistent:
             d[name] = serializer(name, d[name])
+
+    def get_state(self):
+        return ()
 
 
 class Chain(Link):

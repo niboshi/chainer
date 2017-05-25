@@ -360,15 +360,29 @@ class DataCollection(object):
 class Gnode(object):
     def __init__(self, obj_type, tag, metatag, name, extra_clue):
         assert tag is None or isinstance(tag, str)
-        assert isinstance(obj_type, type)
+
+        if obj_type is None:
+            # Placeholder
+            # Only metatag can have a value
+            assert tag is None
+            assert name is None
+            assert extra_clue is None
+
+            extra_clue = ()
+            self.in_edges = None
+            self.out_edges = None
+            self.kind = None
+        else:
+            assert isinstance(obj_type, type)
+
+            self.in_edges = set()
+            self.out_edges = set()
+            self.kind = Gnode._get_kind(obj_type)
 
         self.tag = tag
         self.metatag = metatag
         self.obj_type = obj_type
-        self.in_edges = set()
-        self.out_edges = set()
         self.extra_clue = extra_clue
-        self.kind = Gnode._get_kind(obj_type)
 
         # node_config could either be dict or GnodeConfig.
         self.node_config = None
@@ -384,14 +398,30 @@ class Gnode(object):
             assert 'data' not in node_config
         self.node_config = node_config
 
+    @classmethod
+    def make_placeholder(cls, metatag=None):
+        return cls(None, None, metatag, None, None)
+
+    @property
+    def is_placeholder(self):
+        return self.obj_type is None
+
+    @property
+    def has_edges(self):
+        return ((self.in_edges is not None and len(self.in_edges) > 0) or
+                (self.out_edges is not None and len(self.out_edges) > 0))
+
     @property
     def clue(self):
         return (self.kind, self.tag, self.metatag, self.name) + self.extra_clue
 
     def __repr__(self):
-        name = 'Gnode' if self.tag is None else 'Gnode@{}'.format(self.tag)
-        return '<{} {:x} in={} out={} type={}>'.format(
-            name, id(self), len(self.in_edges), len(self.out_edges), self.obj_type.__name__)
+        if self.is_placeholder:
+            return '<Gnode(placeholder) metatag={}>'.format(self.metatag)
+        else:
+            name = 'Gnode' if self.tag is None else 'Gnode@{}'.format(self.tag)
+            return '<{} {:x} in={} out={} type={}>'.format(
+                name, id(self), len(self.in_edges), len(self.out_edges), self.obj_type.__name__)
 
     @classmethod
     def _get_kind(cls, obj_type):
@@ -408,15 +438,19 @@ class Gnode(object):
 
     @classmethod
     def from_obj(cls, obj, tag, metatag):
-        assert not isinstance(obj, SubgraphObj)
-        if isinstance(obj, (variable.VariableNode,) + _ndarrays):
+        assert obj is None or not isinstance(obj, SubgraphObj)
+        if obj is None:
+            # Placeholder gnode
+            assert tag is None
+            return cls.make_placeholder(metatag)
+        elif isinstance(obj, (variable.VariableNode,) + _ndarrays):
             return VariableGnode(obj, tag, metatag)
         elif isinstance(obj, function.Function):
             return FunctionGnode(obj, tag, metatag)
-
-        clue = cls.get_extra_clue(obj, tag)
-        return Gnode(
-            type(obj), tag, get_name(obj), clue)
+        else:
+            clue = cls.get_extra_clue(obj, tag)
+            return Gnode(
+                type(obj), tag, get_name(obj), clue)
 
     @classmethod
     def get_clue(cls, obj, tag, metatag):
@@ -491,7 +525,7 @@ class VariableGnode(Gnode):
             name,
             ('\'' + self.name + '\'') if self.name else None,
             '{:x}'.format(id(self)), self.shape, self.dtype,
-            'fp={}'.format(self.clue),
+            'clue={}'.format(self.clue),
         ]
         return '<{}>'.format(
             ' '.join(str(_) for _ in lst if _ is not None))
@@ -583,6 +617,8 @@ class Graph(object):
         self._inherited_node_configs = inherited_node_configs
         self._node_configs = None
 
+        self._last_context = None
+
     def lock(self):
         self._lock.acquire()
 
@@ -625,11 +661,21 @@ class Graph(object):
         return len(self.nodes) == 0
 
     @property
+    def has_edges(self):
+        """Test if the graph has any edges.
+
+        In most cases this is as fast as N(1).
+        """
+        return any(node.has_edges for node in self.nodes)
+
+    @property
     def edges(self):
         edges = set()
         for node in self.nodes:
-            edges.update(node.in_edges)
-            edges.update(node.out_edges)
+            if node.in_edges:
+                edges.update(node.in_edges)
+            if node.out_edges:
+                edges.update(node.out_edges)
         return edges
 
     def set_tag(self, node, tag):
@@ -650,7 +696,7 @@ class Graph(object):
 
         for i,(obj, tag, metatag) in enumerate(output_variables):
             gnode = self.output_nodes[i]
-            if gnode is not None:
+            if gnode is not None and not gnode.is_placeholder:
                 if gnode.tag != tag:
                     raise RuntimeError("Inconsistent tag of output variable ({} -> {}) between passes".format(gnode.tag, tag))
                 continue
@@ -667,13 +713,20 @@ class Graph(object):
 
     def submit_inputs(self, input_tuples):
         if self.input_nodes is None:
-            self.input_nodes = []
-            for i,(obj,tag,metatag) in enumerate(input_tuples):
-                assert tag is None or self.find_node(tag) is None
-                obj_ = _get_obj(obj)
-                gnode = Gnode.from_obj(obj_, tag, metatag)
-                self._add_node(gnode)
-                self.input_nodes.append(gnode)
+            self.input_nodes = [None] * len(input_tuples)
+
+        for i,(obj,tag,metatag) in enumerate(input_tuples):
+            if tag is not None and self.find_node(tag) is not None:
+                continue
+            if (self.input_nodes[i] is not None and
+                not self.input_nodes[i].is_placeholder):
+                continue
+
+            obj_ = _get_obj(obj)
+            gnode = Gnode.from_obj(obj_, tag, metatag)
+            self._add_node(gnode)
+            self.input_nodes[i] = gnode
+            self.debug('input gnode: {}'.format(gnode))
 
         assert len(self.input_nodes) == len(input_tuples)
 
@@ -715,16 +768,18 @@ class Graph(object):
 
     def _add_node(self, node):
         if node not in self.nodes:
-            if node.tag is not None:
-                if node.tag in self.node_map:
-                    raise RuntimeError('Duplicate tag is detected.')
+            if not node.is_placeholder:
+                if node.tag is not None:
+                    if node.tag in self.node_map:
+                        raise RuntimeError('Duplicate tag is detected (\'{}\')'.format(node.tag))
 
-                # Store node config if any
-                node_config = self.get_node_config(node.tag)
-                if node_config is not None:
-                    node.set_node_config(node_config)
+                    # Store node config if any
+                    node_config = self.get_node_config(node.tag)
+                    if node_config is not None:
+                        node.set_node_config(node_config)
 
-            self.node_map[node.tag] = node
+                self.node_map[node.tag] = node
+
             self.nodes.add(node)
             self.debug("{}: Gnode added: {}".format(self.tag, node))
 
@@ -750,10 +805,13 @@ class Graph(object):
 
         # No node should be isolated
         for node in self.nodes:
-            assert len(node.in_edges) > 0 or len(node.out_edges) > 0
+            assert (node.is_placeholder or
+                    len(node.in_edges) > 0 or len(node.out_edges) > 0), node
 
         # Test node connections
         for node in self.nodes:
+            if node.is_placeholder:
+                continue
             for in_edge in node.in_edges:
                 assert in_edge.out_gnode == node
                 in_gnode = in_edge.in_gnode
@@ -953,6 +1011,8 @@ class GraphContext(object):
 
         self._output_variables_of_last_pass = []
 
+        graph._last_context = self
+
     def start_pass(self, inputs, trainer=None):
         # See: comment of end_pass()
         last_outputs = [_() for _ in self._output_variables_of_last_pass]
@@ -965,7 +1025,7 @@ class GraphContext(object):
         # If a weak reference is invalidated, that means the variable is no longer used
         # and cannot be a part of the input variables.
         self._output_variables_of_last_pass = [
-            weakref.ref(v) for v,_,_ in self.output_variables]
+            weakref.ref(v) for v,_,_ in self.output_variables if v is not None]
 
         self._cleanup_pass()
 
@@ -979,9 +1039,9 @@ class GraphContext(object):
         # chainer.Variable
         self.output_variables = None
         self.input_variables = inputs
-        self.last_output_variables = last_outputs
+        self.last_output_variables = {id(_._node) for _ in last_outputs}
 
-        self.input_variable_set = set([id(_get_obj(_)) for _ in inputs])
+        self.input_variable_set = {id(_get_obj(_)) for _ in inputs if _ is not None}
 
         # chainer.VariableNode -> tag, metatag
         self.variable_map = {}
@@ -1025,16 +1085,18 @@ class GraphContext(object):
     def set_output(self, outputs):
         self.debug("set_output: {}".format(outputs))
         assert not self._closed
+        assert any(_ is not None for _ in outputs)
         output_variables = []
 
         for i,var in enumerate(outputs):
             obj_ = _get_obj(var)
             tag, metatag = self._get_variable_tags(var)
-            assert metatag is None
 
             # If the output variable is not tagged,
             # put a metatag to avoid creating loop connection to this variable.
-            if tag is None:
+            # Note that `outputs` can have multiple duplicate variables,
+            # in which case metatag can be non-None for latter variables.
+            if tag is None and metatag is None:
                 metatag = '$o{}'.format(i)
 
             self.variable_map[id(obj_)] = (tag, metatag)
@@ -1044,8 +1106,7 @@ class GraphContext(object):
         self._closed = True
 
         #
-        self.debug("set_output: {}".format(self.subgraph_output_map))
-        self.debug("set_output: {}".format(self.subgraph_output_map))
+        self.debug("subgraph_output_map: {}".format(self.subgraph_output_map))
         # Create output variables to the graph
         self.graph.submit_outputs(self.output_variables)
 
@@ -1066,6 +1127,8 @@ class GraphContext(object):
         return False
 
     def _get_variable_tags(self, obj):
+        if obj is None:
+            return None, None
         obj_ = _get_obj(obj)
         tup = self.variable_map.get(id(obj_), None)
 
@@ -1132,8 +1195,16 @@ class GraphContext(object):
         if DEBUG:
             print("{}: {}".format(self.tag, s))
 
+    def get_compatible_gnodes(self, obj, tag, metatag, created_gnodes):
+        clue = Gnode.get_clue(obj, tag, metatag)
+        gnodes = self.graph.get_compatible_nodes(obj, tag, metatag)
+        for gnode in created_gnodes:
+            if gnode.clue == clue:
+                gnodes.append(gnode)
+        return gnodes
+
     def _find_matches_partial_tree(self, obj, prev_mnode, state, config):
-        """ Returns: [] of MatchSolution
+        """ Returns: (None, <hit_creation_limit>) if no solution
         """
 
         rec = self._find_matches_partial_tree
@@ -1148,7 +1219,8 @@ class GraphContext(object):
         def debug(s):
             self.debug("{}{}".format("   " * depth, s))
 
-        if state.created_edges + state.created_nodes > config.max_create:
+        if (config.max_create is not None and
+            state.created_edges + state.created_nodes > config.max_create):
             debug("Exceed: {} + {} > {}".format(
                 state.created_edges, state.created_nodes, config.max_create))
             return [], True
@@ -1159,7 +1231,12 @@ class GraphContext(object):
 
         if self._is_input_variable(obj):
             mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
-            debug("Reached input variable: {}".format(id(obj)))
+            debug("Reached input variable: {}".format(obj.shape))
+            return [MatchSolution([mnode], [])], False
+
+        if id(obj) in self.last_output_variables:
+            mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
+            debug("Reached last output variable: {}".format(id(obj)))
             return [MatchSolution([mnode], [])], False
 
         else:
@@ -1210,7 +1287,7 @@ class GraphContext(object):
             else:
                 assert False
 
-            assert all(isinstance(_, (variable.VariableNode, function.Function, SubgraphObj) + _ndarrays) for _ in inputs)
+            assert all(_ is None or isinstance(_, (variable.VariableNode, function.Function, SubgraphObj) + _ndarrays) for _ in inputs)
             assert len(arg_indices) == len(inputs)
 
 
@@ -1219,6 +1296,13 @@ class GraphContext(object):
             hit_creation_limit = False
 
             for i, (in_obj, in_arg_index) in enumerate(zip(inputs, arg_indices)):
+                if in_obj is None:
+                    if in_arg_solutions[i] is None:
+                        in_arg_solutions[i] = [MatchSolution([], [])]
+                    else:
+                        in_arg_solutions[i] += [MatchSolution([], [])]
+                    continue
+
                 debug('input {}: {}'.format(i, type(in_obj)))
                 if isinstance(in_obj, (variable.VariableNode,) + _ndarrays):
                     in_tag, in_metatag = self._get_variable_tags(in_obj)
@@ -1323,7 +1407,6 @@ class GraphContext(object):
         # Find the best match
         solution = self._find_best_match_tree()
         assert not solution.empty()
-        assert len(solution.input_nodes) == len(self.input_variables)
 
         # Create graph nodes and edges according to the match tree
         mnodes = self._submit_match_tree(solution)
@@ -1338,8 +1421,11 @@ class GraphContext(object):
         self.graph.assert_consistent()
 
     def _find_best_match_tree(self):
-        if self.graph.is_empty:
-            configs = (MatchConfig(can_create_edge=True, can_create_node=True, max_create=_) for _ in itertools.count(1))
+        self.debug("Finding the best match tree.")
+        print("{}: Finding the best match tree.".format(self.tag))
+        if not self.graph.has_edges and False:
+            #configs = (MatchConfig(can_create_edge=True, can_create_node=True, max_create=_) for _ in itertools.count(1))
+            configs = [MatchConfig(can_create_edge=True, can_create_node=True, max_create=None)]
         else:
             configs = itertools.chain(
                 [
@@ -1352,6 +1438,8 @@ class GraphContext(object):
             hit_creation_limit = False
             solution = MatchSolution()
             for (out_var, _, _), out_gnode in zip(self.output_variables, self.graph.output_nodes):
+                if out_var is None:
+                    continue
                 with MatchState(None, out_gnode, None, False, False, out_var) as st:
                     sols, hit_cl = self._find_matches_partial_tree(out_var._node, None, st, config)
                     hit_creation_limit = hit_creation_limit or hit_cl
@@ -1363,15 +1451,19 @@ class GraphContext(object):
                 solution.merge(sols[0])
 
             if all_output_solved:
+                self.debug("Solution found: {}".format(solution))
                 break
 
-            if config.max_create > 0 and not hit_creation_limit:
+            if (config.max_create is not None and config.max_create > 0 and
+                not hit_creation_limit):
                 # Solution has not been found, and node/edge creation limit
                 # has not been reached. That means there's some glitch in
                 # matching logic...
                 assert False
 
-        self.debug("Solution found")
+        if solution.empty():
+            self.debug("Solution not found")
+            assert False
 
         return solution
 
@@ -1504,7 +1596,10 @@ class graph(object):
             # Take the graph from the outer context
             graph, _ = outer_context.graph.get_subgraph(tag, create=True)
 
-            context = GraphContext(tag, graph)
+            context = graph._last_context
+            if context is None:
+                context = GraphContext(tag, graph)
+
             current_thread.__dict__['graph_context'] = context
 
             context.start_pass(input_variables, trainer=outer_context.trainer)
