@@ -7,13 +7,13 @@ from ._graph_summary.http_server import run_server  # NOQA
 from ._graph_summary.extension import GraphSummary  # NOQA
 
 
-def get_current_context():
+def current():
     current_thread = threading.current_thread()
     context = current_thread.__dict__.get('graph_context', None)
     return context
 
 
 def set_tag(*args, **kwargs):
-    context = get_current_context()
+    context = current()
     if context is not None:
         context.set_tag(*args, **kwargs)

@@ -145,8 +145,11 @@ class Link(object):
         tag = self.name
         if tag is None:
             tag = self.__class__.__name__.lower()
-        with graph(inputs + self.get_state(), tag) as g:
-            y = self.__call_link__(*inputs)
+        states = self.get_state()
+        graph_inputs = [_ if _ is None or isinstance(_, variable.Variable) else variable.Variable(_) for _ in inputs]
+        graph_states = [_ if _ is None or isinstance(_, variable.Variable) else variable.Variable(_) for _ in states]
+        with graph(graph_inputs + graph_states, tag) as g:
+            y = self.__call_link__(*(graph_inputs + graph_states))
             g.set_output((y,) + self.get_state())
             return y
 

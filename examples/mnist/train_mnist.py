@@ -40,52 +40,51 @@ class MLP(chainer.Chain):
     def __call_link__(self, x):
         global iii
 
-        with graph_summary.graph([x], 'g') as g:
-            g.set_tag(x, 'input')
-            g.config_node(x, data=[
-                ('latest', dict(
-                    preprocess=lambda x: x[-1,:].reshape((28,28))[-1::-1,:],
-                )),
-                ('average', dict(
-                    data_reduce='average',
-                    preprocess=lambda x: x.mean(axis=0).reshape((28,28))[-1::-1,:],
-                    store_trigger=(1, 'epoch'),
-                    reset_trigger=(1, 'epoch'),
-                )),
-            ])
-            h = self.l1(x)
+        g = graph_summary.current()
 
-            g.set_tag(h, 'hh')
+        g.config_node(x, data=[
+            ('latest', dict(
+                preprocess=lambda x: x[-1,:].reshape((28,28))[-1::-1,:],
+            )),
+            ('average', dict(
+                data_reduce='average',
+                preprocess=lambda x: x.mean(axis=0).reshape((28,28))[-1::-1,:],
+                store_trigger=(1, 'epoch'),
+                reset_trigger=(1, 'epoch'),
+            )),
+        ])
+        h = self.l1(x)
 
+        g.set_tag(h, 'hh')
+
+        if iii % 2 == 0:
+            h = F.relu(h)
+            g.set_tag(h, 'h1_relu')
+        else:
+            h = F.sigmoid(h)
+            g.set_tag(h, 'h1_sigmoid')
+
+        with graph_summary.graph([h], 'g2') as g2:
             if iii % 2 == 0:
-                h = F.relu(h)
-                g.set_tag(h, 'h1_relu')
+                h = F.relu(self.l2(h))
             else:
-                h = F.sigmoid(h)
-                g.set_tag(h, 'h1_sigmoid')
+                h = F.sigmoid(self.l2(h))
 
-            with graph_summary.graph([h], 'g2') as g2:
-                if iii % 2 == 0:
-                    h = F.relu(self.l2(h))
-                else:
-                    h = F.sigmoid(self.l2(h))
+            g2.set_output([h])
 
-                g2.set_output([h])
-
-            h = self.l3(h)
-            g.set_tag(h, 'output')
-            g.config_node(h, data=[
-                ('latest', dict(
-                    preprocess=lambda x: x[-1,:].reshape(1,10),
-                )),
-                ('average', dict(
-                    data_reduce='average',
-                    preprocess=lambda x: x[-1,:].reshape(1,10),
-                    store_trigger=(1, 'epoch'),
-                    reset_trigger=(1, 'epoch'),
-                )),
-            ])
-            g.set_output([h])
+        h = self.l3(h)
+        g.set_tag(h, 'output')
+        g.config_node(h, data=[
+            ('latest', dict(
+                preprocess=lambda x: x[-1,:].reshape(1,10),
+            )),
+            ('average', dict(
+                data_reduce='average',
+                preprocess=lambda x: x[-1,:].reshape(1,10),
+                store_trigger=(1, 'epoch'),
+                reset_trigger=(1, 'epoch'),
+            )),
+        ])
 
         iii += 1
         return h
