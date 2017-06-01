@@ -38,6 +38,18 @@ class MLP(chainer.Chain):
             self.l3 = L.Linear(None, n_out)  # n_units -> n_out
 
     def __call_link__(self, x):
+        #x1 = x + 1
+        #x2 = x * 2
+        x2 = x
+        s = F.hstack([x2, x2, x2, x2])
+        return s
+        #xx1, xx2 = F.lstm(x, s)
+        #xx = F.concat([xx1, xx2])
+        xx = s
+        return self.l3(xx)
+
+
+    def __call_link2__(self, x):
         global iii
 
         g = graph_summary.current()

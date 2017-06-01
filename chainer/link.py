@@ -149,7 +149,7 @@ class Link(object):
         graph_inputs = [_ if _ is None or isinstance(_, variable.Variable) else variable.Variable(_) for _ in inputs]
         graph_states = [_ if _ is None or isinstance(_, variable.Variable) else variable.Variable(_) for _ in states]
         with graph(graph_inputs + graph_states, tag) as g:
-            y = self.__call_link__(*(graph_inputs + graph_states))
+            y = self.__call_link__(*graph_inputs)
             g.set_output((y,) + self.get_state())
             return y
 

@@ -205,7 +205,8 @@ def main():
     optimizer.add_hook(chainer.optimizer.GradientClipping(args.gradclip))
 
     # Set up a trainer
-    updater = BPTTUpdater(train_iter, optimizer, args.bproplen, args.gpu)
+    updater = training.StandardUpdater(train_iter, optimizer)
+    #updater = BPTTUpdater(train_iter, optimizer, args.bproplen, args.gpu)
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     eval_model = model.copy()  # Model with shared params and distinct states

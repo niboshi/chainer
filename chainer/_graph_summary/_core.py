@@ -12,7 +12,14 @@ from chainer import function
 from chainer.training import util as trigger_util
 
 
-DEBUG = False
+DEBUG = True
+
+class SpecialObject:
+    pass
+
+
+ROOT_OBJ = SpecialObject()
+PLACEHOLDER_OBJ = SpecialObject()
 
 
 if cuda.available:
@@ -358,13 +365,13 @@ class DataCollection(object):
 
 
 class Gnode(object):
-    def __init__(self, obj_type, tag, metatag, name, extra_clue):
+    def __init__(self, obj_type, tag, metatag, name, extra_clue, n_outputs):
         assert tag is None or isinstance(tag, str)
 
-        if obj_type is None:
+        if obj_type is SpecialObject:
             # Placeholder
             # Only metatag can have a value
-            assert tag is None
+            assert tag is not None
             assert name is None
             assert extra_clue is None
 
@@ -383,6 +390,7 @@ class Gnode(object):
         self.metatag = metatag
         self.obj_type = obj_type
         self.extra_clue = extra_clue
+        self.n_outputs = n_outputs
 
         # node_config could either be dict or GnodeConfig.
         self.node_config = None
@@ -400,11 +408,19 @@ class Gnode(object):
 
     @classmethod
     def make_placeholder(cls, metatag=None):
-        return cls(None, None, metatag, None, None)
+        return cls(SpecialObject, 'PLACEHOLDER', metatag, None, None, None)
+
+    @classmethod
+    def make_root(cls):
+        return cls(SpecialObject, 'ROOT', None, None, None, None)
 
     @property
     def is_placeholder(self):
-        return self.obj_type is None
+        return self.obj_type is SpecialObject and self.tag == 'PLACEHOLDER'
+
+    @property
+    def is_root(self):
+        return self.obj_type is SpecialObject and self.tag == 'ROOT'
 
     @property
     def has_edges(self):
@@ -418,6 +434,8 @@ class Gnode(object):
     def __repr__(self):
         if self.is_placeholder:
             return '<Gnode(placeholder) metatag={}>'.format(self.metatag)
+        elif self.is_root:
+            return '<Gnode(root)>'
         else:
             name = 'Gnode' if self.tag is None else 'Gnode@{}'.format(self.tag)
             return '<{} {:x} in={} out={} type={}>'.format(
@@ -492,7 +510,8 @@ class Gnode(object):
     def from_graph(cls, obj, tag, metatag):
         return Gnode(
             type(obj), tag, metatag, get_name(obj),
-            cls.get_graph_clue(obj, tag))
+            cls.get_graph_clue(obj, tag),
+            obj.n_outputs)
 
     @classmethod
     def get_graph_clue(cls, graph, tag):
@@ -504,7 +523,7 @@ class VariableGnode(Gnode):
         assert isinstance(var, (variable.VariableNode,) + _ndarrays)
         name = var.name if isinstance(var, variable.VariableNode) else None
         extra_clue = VariableGnode.get_extra_clue(var, tag)
-        super(VariableGnode, self).__init__(type(var), tag, metatag, name, extra_clue)
+        super(VariableGnode, self).__init__(type(var), tag, metatag, name, extra_clue, None)
 
         self.shape = var.shape
         self.dtype = var.dtype
@@ -549,7 +568,7 @@ class VariableGnode(Gnode):
 class FunctionGnode(Gnode):
     def __init__(self, func, tag, metatag):
         extra_clue = FunctionGnode.get_extra_clue(func, tag)
-        super(FunctionGnode, self).__init__(type(func), tag, metatag, type(func).__name__, extra_clue)
+        super(FunctionGnode, self).__init__(type(func), tag, metatag, type(func).__name__, extra_clue, len(func.outputs))
 
     @classmethod
     def get_extra_clue(cls, obj, tag):
@@ -619,11 +638,17 @@ class Graph(object):
 
         self._last_context = None
 
+        self.root_gnode = Gnode.make_root()
+
     def lock(self):
         self._lock.acquire()
 
     def unlock(self):
         self._lock.release()
+
+    @property
+    def n_outputs(self):
+        return len(self.output_nodes)
 
     def config_node(self, tag_path, **kwargs):
         tag_path = tag_path.split('/')
@@ -738,16 +763,23 @@ class Graph(object):
         subgraph = self.subgraphs.get(tag)
         if subgraph is None:
             if not create:
-                return None, None
+                return None
 
             subconfigs = self.get_node_config(tag)
-
             subgraph = Graph(tag, subconfigs)
             self.subgraphs[tag] = subgraph
+        return subgraph
+
+    def set_subgraph(self, tag, subgraph):
+        assert tag not in self.subgraphs
+        self.subgraphs[tag] = subgraph
+
+    def create_subgraph_node(self, tag):
+        subgraph = self.subgraphs[tag]
+        node = self.node_map.get(tag)
+        if node is None:
             node = self._add_graph_node(subgraph, tag, None)
-        else:
-            node = self.node_map[tag]
-        return subgraph, node
+        return node
 
     def get_compatible_nodes(self, obj, tag, metatag):
         clue = Gnode.get_clue(obj, tag, metatag)
@@ -935,47 +967,102 @@ class MatchNode:
         return out_edge
 
 
+class MatchStateChain:
+    """Keeps track of created nodes/edges"""
+
+    def __init__(self, search, prev_chain, edge, created_gnode):
+        assert isinstance(search, MatchSearch)
+        assert prev_chain is None or isinstance(prev_chain, MatchStateChain)
+        assert isinstance(edge, tuple)
+        assert len(edge) == 3
+        assert isinstance(created_gnode, bool)
+
+        if prev_chain is not None:
+            assert prev_chain.next_chain is None
+
+        self.search = search
+        self.created_gnode = created_gnode
+        self.prev_chain = prev_chain
+        self.next_chain = None
+        self.edge = edge
+        self.abandoned = False
+        self.created_gnodes = created_gnode
+        self.visited_objs = []
+        if prev_chain is not None:
+            prev_chain.next_chain = self
+            self.n_created_gnodes = prev_chain.n_created_gnodes
+            self.n_created_edges = prev_chain.n_created_edges + 1
+        else:
+            self.n_created_gnodes = 0
+            self.n_created_edges = 1
+
+        if self.created_gnode:
+            self.n_created_gnodes += 1
+
+
+        self.search.push_edge(self.edge)
+        if self.created_gnode:
+            self.search.push_created_gnode(self.edge[0])
+
+        self.search.debug("New state: {}".format(self))
+
+    def __repr__(self):
+        return '<MatchStateChain depth={} created_gnode={}, edge={}>'.format(
+            self.depth,
+            self.created_gnode,
+            self.edge)
+
+    @property
+    def depth(self):
+        if self.prev_chain is None:
+            return 0
+        else:
+            return self.prev_chain.depth + 1
+
+    def visit(self, obj):
+        self.visited_objs.append(obj)
+        self.search.visit(obj)
+
+    def abandon(self):
+        if self.abandoned:
+            return
+
+        self.search.debug("Abandon: {}".format(self))
+        if self.next_chain is not None:
+            self.next_chain.abandon()
+            self.next_chain = None
+
+        self.search.pop_edge(self.edge)
+        if self.created_gnode:
+            self.search.pop_created_gnode(self.edge[0])
+
+        for obj in self.visited_objs:
+            self.search.unvisit(obj)
+
+        if self.prev_chain is not None:
+            assert self.prev_chain.next_chain is self
+            self.prev_chain.next_chain = None
+
+        self.abandoned = True
+
+
 class MatchStackFrame:
-    def __init__(self, search, prev_frame, gnode, arg_index, create_edge, create_node, obj):
+    """Represents the graph traversal"""
+
+    """Just for tracking back?"""
+
+    def __init__(self, search, prev_frame, gnode, arg_index, obj):
         self.search = search
         self.prev_frame = prev_frame
         self.gnode = gnode
         self.arg_index = arg_index
         if prev_frame is None:
             self.depth = 0
-            self.created_edges = 0
-            self.created_nodes = 0
-            self.visited_objs = {}
         else:
             assert prev_frame.good
             self.depth = prev_frame.depth + 1
-            self.created_edges = prev_frame.created_edges
-            self.created_nodes = prev_frame.created_nodes
-            self.visited_objs = prev_frame.visited_objs
-
-        if create_edge:
-            self.created_edges += 1
-        if create_node:
-            self.created_nodes += 1
 
         self.obj = obj
-        self.good = True
-
-    def __enter__(self):
-        if not isinstance(self.obj, SubgraphObj):
-            if id(self.obj) in self.visited_objs:
-                self.good = False
-
-        if self.good:
-            self.visited_objs[id(self.obj)] = self.visited_objs.get(id(self.obj), 0) + 1
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.good:
-            if self.visited_objs[id(self.obj)] == 1:
-                del self.visited_objs[id(self.obj)]
-            else:
-                self.visited_objs[id(self.obj)] -= 1
         self.good = True
 
     @property
@@ -987,19 +1074,21 @@ class MatchStackFrame:
 
 
 class MatchSolution:
-    def __init__(self, input_nodes=None, floating_nodes=None):
+    def __init__(self, input_nodes, floating_nodes, state_frame):
         self.input_nodes = input_nodes or []
         self.floating_nodes = floating_nodes or []
+        self.state_frame = state_frame
+
+    @classmethod
+    def incr(cls, base_sol, input_nodes, floating_nodes, state_frame):
+        return MatchSolution(
+            base_sol.input_nodes + input_nodes,
+            base_sol.floating_nodes + floating_nodes,
+            state_frame)
 
     def __repr__(self):
         return '<MatchSolution {} {}>'.format(
             len(self.input_nodes), len(self.floating_nodes))
-
-    @classmethod
-    def merge(cls, sol1, sol2):
-        input_nodes = list(set(sol1.input_nodes + sol2.input_nodes))
-        floating_nodes = list(set(sol1.floating_nodes + sol2.floating_nodes))
-        return MatchSolution(input_nodes, floating_nodes)
 
     def empty(self):
         return len(self.input_nodes) == 0 and len(self.floating_nodes) == 0
@@ -1013,34 +1102,108 @@ class MatchSearch:
         self.config = config
         self.context = context
 
+        self.head_frame = None
+        self.head_state = None
+
+        # (Gnode, bool_in) -> (Gnode_in, Gnode_out, arg_index)
+        self.edges = {}
+
         self.created_gnodes = set()
+        self.visited_objs = set()
+
+    def is_edge_filled(self, gnode, is_input, arg_index):
+        s = self.edges.get((gnode, is_input))
+        if s:
+            return any(_[2] == arg_index for _ in s)
+
+    def is_out_edges_filled(self, gnode):
+        n_outputs = gnode.n_outputs
+        if n_outputs is None or n_outputs == 0:
+            return True
+        else:
+            s = self.edges.get((gnode, True))
+            return s is not None and len(s) == n_outputs
+
+    def is_all_gnodes_filled(self):
+        # Check output of every gnodes are filled
+        gnodes = set(_[0] for _ in self.edges.keys() if _[1] == False)
+        return all(self.is_out_edges_filled(_) for _ in  gnodes)
+
+    def is_visited(self, obj):
+        return False
+        return id(_get_obj(obj)) in self.visited_objs
+
+    def visit(self, obj):
+        return
+        assert not self.is_visited(obj)
+        self.visited_objs.add(id(_get_obj(obj)))
+
+    def unvisit(self, obj):
+        return
+        self.visited_objs.remove(id(_get_obj(obj)))
+
+    def has_edge(self, tup):
+        in_gnode = tup[0]
+        set_ = self.edges.get((in_gnode, True))
+        if set_ is None:
+            return False
+        return tup in set_
+
+    def push_edge(self, tup):
+        in_gnode, out_gnode, arg_index = tup
+
+        self.debug("push_edge: {}".format(tup))
+
+        def add_edge(key, tup):
+            set_ = self.edges.get(key)
+            if set_ is None:
+                set_ = self.edges[key] = set()
+            assert tup not in set_
+            set_.add(tup)
+
+        add_edge((in_gnode, True), tup)
+        add_edge((out_gnode, False), tup)
+
+    def pop_edge(self, tup):
+        in_gnode, out_gnode, arg_index = tup
+        # Remove edges.
+        # If a node attached to the edge is one of the created node,
+        # and it is no longer used, remove it from the created nodes.
+
+        set_ = self.edges[(in_gnode, True)]
+        set_.remove(tup)
+
+        set_ = self.edges[(out_gnode, False)]
+        set_.remove(tup)
+
+    def push_created_gnode(self, gnode):
+        self.debug("Push created gnode: {}".format(gnode))
+        self.debug("search: {}".format(self))
+        assert gnode not in self.created_gnodes
+        self.created_gnodes.add(gnode)
+        self.debug("Set: {}".format(self.created_gnodes))
+
+    def pop_created_gnode(self, gnode):
+        self.debug("Pop created gnode: {}".format(gnode))
+        self.debug("search: {}".format(self))
+        self.created_gnodes.remove(gnode)
+        self.debug("Set: {}".format(self.created_gnodes))
 
     def run(self):
-        context = self.context
+        frame = MatchStackFrame(self, None, self.context.graph.root_gnode, None, ROOT_OBJ)
+        sol_ = MatchSolution([], [], frame)
+        state = None
+        try:
+            sol, st = next(self._find_matches_partial_tree(sol_, None, frame, state))
+        except StopIteration:
+            sol, st = None, None
 
-        all_output_solved = True
-        solution = MatchSolution()
-        assert len(context.output_variables) == len(context.graph.output_nodes)
-        for (out_var, _, _), out_gnode in zip(context.output_variables, context.graph.output_nodes):
-            if out_var is None:
-                continue
-            with MatchStackFrame(self, None, out_gnode, None, False, False, out_var) as st:
-                try:
-                    sol, _ = next(self._find_matches_partial_tree(out_var._node, None, st))
-                except StopIteration:
-                    # No solution for this output variable
-                    all_output_solved = False
-                    break
-
-            # Takes the first solution
-            solution = MatchSolution.merge(solution, sol)
-
-        if all_output_solved:
+        if sol:
             # Solution found
-            self.debug("Solution found: {}".format(solution))
-            self.debug("  input_nodes: {}".format(solution.input_nodes))
-            self.debug("  floating_nodes: {}".format(solution.floating_nodes))
-            return solution
+            self.debug("Solution found: {}".format(sol))
+            self.debug("  input_nodes: {}".format(sol.input_nodes))
+            self.debug("  floating_nodes: {}".format(sol.floating_nodes))
+            return sol
 
         else:
             # No solution
@@ -1048,20 +1211,29 @@ class MatchSearch:
 
     def debug(self, s):
         if DEBUG:
-            print("{}: {}".format(self.context.tag, s))
+            print("{} {}: {}".format(self.context.tag, len(self.created_gnodes), s))
 
-    def _find_matches_partial_tree(self, obj, prev_mnode, frame):
-        """ Yields (solution, solution state)
+    def _find_matches_partial_tree(self, prev_sol, prev_mnode, frame, state):
+        """ Yields solution
         """
 
+        assert state is None or isinstance(state, MatchStateChain)
+
         def debug(s):
-            self.debug("{}{}".format("   " * frame.depth, s))
+            self.debug("{}{}".format("        " * frame.depth, s))
 
         config = self.config
         context = self.context
 
+        obj = frame.obj
         gnode = frame.gnode
         arg_index = frame.arg_index
+
+        if not self.is_out_edges_filled(gnode):
+            assert False
+            yield prev_sol, state
+            debug("Not filled yet. returning")
+            return
 
         debug("Obj = {!r}".format(obj))
         debug("gnode = {}".format(gnode))
@@ -1069,41 +1241,50 @@ class MatchSearch:
         assert isinstance(gnode, Gnode)
         assert prev_mnode is None or isinstance(prev_mnode, MatchNode)
 
-        if (config.max_create is not None and
-            frame.created_edges + frame.created_nodes > config.max_create):
-            # Failure: Maximum created edges/nodes reached
-            debug("Exceed: {} + {} > {}".format(
-                frame.created_edges, frame.created_nodes, config.max_create))
-            return
+        if prev_mnode is not None:
+            if (config.max_create is not None and
+                state is not None and
+                state.n_created_edges + state.n_created_gnodes > config.max_create):
+                # Failure: Maximum created edges/nodes reached
+                debug("Exceed: {} + {} > {}".format(
+                    state.n_created_edges, state.n_created_gnodes, config.max_create))
+                return
 
-        if self.context._is_input_variable(obj):
-            # Success: Reached an input variable
-            mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
-            debug("Reached input variable: {}".format(obj.shape))
-            yield MatchSolution([mnode], []), None
-            return
+            if self.context._is_input_variable(obj):
+                # Success: Reached an input variable
+                mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
+                debug("Reached input variable: {}".format(obj.shape))
+                yield MatchSolution(prev_sol.input_nodes + [mnode], prev_sol.floating_nodes, frame), state
+                return
 
-        if id(obj) in context.last_output_variables:
-            # Success: Reached an output variable of last pass
-            mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
-            debug("Reached last output variable: {}".format(id(obj)))
-            yield MatchSolution([mnode], []), None
-            return
+            if id(obj) in context.last_output_variables:
+                # Success: Reached an output variable of last pass
+                mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
+                debug("Reached last output variable: {}".format(id(obj)))
+                yield MatchSolution(prev_sol.input_nodes + [mnode], prev_sol.floating_nodes, frame), state
+                return
+
+            if ((isinstance(obj, variable.VariableNode) and obj.creator is None) or
+                isinstance(obj, _ndarrays)):
+                # Success: Reached a root variable
+                mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
+                debug("Reached floating variable: {}".format(obj.shape))
+                yield MatchSolution(prev_sol.input_nodes, prev_sol.floating_nodes + [mnode], frame), state
+                return
+
+        # From here, we need recursive search
 
         mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
         debug('** Examining node obj: {}'.format(type(obj)))
 
-        if ((isinstance(obj, variable.VariableNode) and obj.creator is None) or
-            isinstance(obj, _ndarrays)):
-            # Success: Reached a root variable
-            mnode = MatchNode(obj, gnode, prev_mnode, arg_index)
-            debug("Reached floating variable: {}".format(obj.shape))
-            yield MatchSolution([], [mnode]), None
-            return
+        if obj is ROOT_OBJ:
+            # Root node
 
-        # From here, we need recursive search
+            assert len(context.output_variables) == len(context.graph.output_nodes)
+            inputs = [_get_obj(_[0]) for _ in context.output_variables]
+            arg_indices = range(len(inputs))
 
-        if isinstance(obj, variable.VariableNode):
+        elif isinstance(obj, variable.VariableNode):
             func = obj.creator
 
             subgraph_tuple = context.subgraph_output_map.get(id(obj))
@@ -1142,36 +1323,52 @@ class MatchSearch:
         debug("Input args: {}".format(len(arg_indices)))
 
         def recurse_next_input(prev_gen, in_obj, in_arg_index):
-            for sol_, state_ in prev_gen:
+            for sol_, st_ in prev_gen:
                 if sol_ is None: continue
-                next_solution_gen = self._recurse_single_input(
-                    mnode, frame, sol_, state_, in_obj, in_arg_index)
 
-                for sol, state in next_solution_gen:
-                    yield sol, state
+                next_solution_gen = self._recurse_single_input(
+                    mnode, frame, sol_, in_obj, in_arg_index, st_)
+
+                for sol, st  in next_solution_gen:
+                    yield sol, st
 
         # solution, state
-        gen = [(MatchSolution([], []), None)]
+        gen = [(prev_sol, state)]
 
         for in_obj, in_arg_index in zip(inputs, arg_indices):
             gen = recurse_next_input(gen, in_obj, in_arg_index)
 
-        for sol, state in gen:
-            yield sol, None
+        for sol, st in gen:
+            yield sol, st
 
-
-    def _recurse_single_input(self, mnode, frame, prev_sol, prev_state, in_obj, in_arg_index):
+    def _recurse_single_input(self, mnode, frame, prev_sol, in_obj, in_arg_index, state):
         assert prev_sol is None or isinstance(prev_sol, MatchSolution)
         def debug(s):
-            self.debug("{}{}".format("   " * frame.depth, s))
+            self.debug("{}{}".format("        " * frame.depth, s))
 
         context = self.context
         config = self.config
         gnode = frame.gnode
 
-        if in_obj is None:
-            yield prev_sol, None
+        if in_obj is None:  # TODO: PLACEHOLDER_OBJ?
+            yield prev_sol, state
             return
+
+        if state is None:
+            assert len(self.created_gnodes) == 0
+            assert len(self.edges) == 0
+
+        if gnode.is_root:
+            # This is root gnode: Recurse into an output variable
+            assert in_obj is _get_obj(context.output_variables[in_arg_index][0])
+            in_gnode = context.graph.output_nodes[in_arg_index]
+
+            frame = MatchStackFrame(self, frame, in_gnode, in_arg_index, in_obj)
+            if frame.good:
+                for sol, st in self._find_matches_partial_tree(prev_sol, mnode, frame, state):
+                    yield sol, st
+            return
+
 
         debug('- input: {} id:{}'.format(type(in_obj), id(in_obj)))
         if isinstance(in_obj, (variable.VariableNode,) + _ndarrays):
@@ -1189,10 +1386,19 @@ class MatchSearch:
         debug('(1)')
         for in_gnode in gnode.get_compatible_in_gnodes(in_obj, in_tag, in_metatag, in_arg_index):
             debug('Compatible node: {}'.format(in_gnode))
-            with MatchStackFrame(self, frame, in_gnode, in_arg_index, False, False, in_obj) as st:
-                if st.good:
-                    for sol, state in self._find_matches_partial_tree(in_obj, mnode, st):
-                        yield MatchSolution.merge(prev_sol, sol), state
+            frame = MatchStackFrame(self, frame, in_gnode, in_arg_index, in_obj)
+            if frame.good:
+                new_state = MatchStateChain(self, state, (in_gnode, gnode, in_arg_index), False)
+                if self.is_visited(in_obj):
+                    self.debug('Visited: {}'.format(in_obj))
+                    yield prev_sol, new_state
+                else:
+                    new_state.visit(in_obj)
+                    for sol, st in self._find_matches_partial_tree(prev_sol, mnode, frame, new_state):
+                        yield sol, st
+                    else:
+                        self.debug("no solution with known inputs: abandon: {} {}".format(gnode, in_gnode))
+                        new_state.abandon()
 
         # (2) Examine compatible gnodes
         to_create_edge = config.can_create_edge
@@ -1200,10 +1406,20 @@ class MatchSearch:
         if to_create_edge:
             debug('(2)')
             for in_gnode in self.get_compatible_gnodes(in_obj, in_tag, in_metatag):
-                with MatchStackFrame(self, frame, in_gnode, in_arg_index, True, False, in_obj) as st:
-                    if st.good:
-                        for sol, state in self._find_matches_partial_tree(in_obj, mnode, st):
-                            yield MatchSolution.merge(prev_sol, sol), state
+                debug('Compatible gnode: {}'.format(in_gnode))
+                frame = MatchStackFrame(self, frame, in_gnode, in_arg_index, in_obj)
+                if frame.good:
+                    new_state = MatchStateChain(self, state, (in_gnode, gnode, in_arg_index), False)
+                    if self.is_visited(in_obj):
+                        debug('Visited: {}'.format(in_obj))
+                        yield prev_sol, new_state
+                    else:
+                        new_state.visit(in_obj)
+                        for sol, st in self._find_matches_partial_tree(prev_sol, mnode, frame, new_state):
+                            yield sol, st
+                        else:
+                            debug("no solution with compatible gnodes: abandon: {} {}".format(gnode, in_gnode))
+                            new_state.abandon()
 
         # (3) Examine creating new gnode
         to_create_node = (
@@ -1213,12 +1429,20 @@ class MatchSearch:
         if to_create_node:
             debug('(3)')
             in_gnode = Gnode.from_obj(in_obj, in_tag, in_metatag)
-            self.created_gnodes.add(in_gnode)
             debug("create: {} {}".format(in_tag, in_obj))
-            with MatchStackFrame(self, frame, in_gnode, in_arg_index, True, True, in_obj) as st:
-                if st.good:
-                    for sol, state in self._find_matches_partial_tree(in_obj, mnode, st):
-                        yield MatchSolution.merge(prev_sol, sol), state
+            frame = MatchStackFrame(self, frame, in_gnode, in_arg_index, in_obj)
+            if frame.good:
+                new_state = MatchStateChain(self, state, (in_gnode, gnode, in_arg_index), True)
+                if self.is_visited(in_obj):
+                    self.debug('Visited: {}'.format(in_obj))
+                    yield prev_sol, new_state
+                else:
+                    new_state.visit(in_obj)
+                    for sol, st in self._find_matches_partial_tree(prev_sol, mnode, frame, new_state):
+                        yield sol, st
+                    else:
+                        debug("no solution with creating gnode: abandon: {} {}".format(gnode, in_gnode))
+                        new_state.abandon()
 
     def get_compatible_gnodes(self, obj, tag, metatag):
         clue = Gnode.get_clue(obj, tag, metatag)
@@ -1261,6 +1485,7 @@ class GraphContext(object):
         self._var_unnamed_tag_counter = 0
         self.buffered_node_configs = None
         self.trainer = trainer
+        self.temp_subgraphs = {}
 
         # chainer.Variable
         self.output_variables = None
@@ -1307,6 +1532,7 @@ class GraphContext(object):
         del self.variable_node_map
         del self.subgraph_output_map
         del self.trainer
+        del self.temp_subgraphs
 
     def set_output(self, outputs):
         self.debug("set_output: {}".format(outputs))
@@ -1421,6 +1647,22 @@ class GraphContext(object):
         if DEBUG:
             print("{}: {}".format(self.tag, s))
 
+    def get_subgraph(self, tag, create=False):
+        assert isinstance(tag, str)
+
+        subgraph = self.graph.get_subgraph(tag, False)
+        if subgraph is not None:
+            # If the graph has the subgraph, return it
+            return subgraph
+        else:
+            # If not, create it within the graph context
+            if not create:
+                return None
+            subconfigs = self.graph.get_node_config(tag)
+            subgraph = Graph(tag, subconfigs)
+            self.temp_subgraphs[tag] = subgraph
+            return subgraph
+
     def submit_subgraph(self, subgraph, input_variables, output_variables, metatag=None):
         self.debug("submit_subgraph: {}".format(subgraph.tag))
 
@@ -1448,6 +1690,11 @@ class GraphContext(object):
             input_tuples.append((var, tag, metatag))
 
         self.graph.submit_inputs(input_tuples)
+
+        # Submit subgraphs
+        for tag, subgraph in self.temp_subgraphs.items():
+            self.graph.set_subgraph(tag, subgraph)
+        self.temp_subgraphs = None
 
         # Find the best match
         solution = self._find_best_match_tree()
@@ -1478,11 +1725,12 @@ class GraphContext(object):
                 (MatchConfig(can_create_edge=True, can_create_node=True, max_create=_) for _ in itertools.count(1)))
 
         for i_try, config in enumerate(configs):
+            self.debug("")
             self.debug("Matching trial {}: config={}".format(i_try, config.__dict__))
             search = MatchSearch(config, self)
             solution = search.run()
 
-            if solution is not None:
+            if solution is not None and search.is_all_gnodes_filled():
                 break
 
         if solution.empty():
@@ -1511,12 +1759,12 @@ class GraphContext(object):
             prev_mnode = mnode.prev_mnode
             if prev_mnode is not None:
                 prev_gnode = prev_mnode.gnode
+                if prev_gnode.is_root:
+                    continue
 
-                out_edge = gnode.get_out_edge(prev_gnode)
-                if out_edge is None:
-                    out_edge = GraphEdge(gnode, prev_gnode, mnode.arg_index)
-                    prev_gnode.in_edges.add(out_edge)
-                    gnode.out_edges.add(out_edge)
+                out_edge = GraphEdge(gnode, prev_gnode, mnode.arg_index)
+                prev_gnode.in_edges.add(out_edge)
+                gnode.out_edges.add(out_edge)
 
                 # Edge statistics
                 out_edge.count += 1
@@ -1618,7 +1866,7 @@ class graph(object):
                 return DummyGraphContext()
 
             # Take the graph from the outer context
-            graph, _ = outer_context.graph.get_subgraph(tag, create=True)
+            graph = outer_context.get_subgraph(tag, create=True)
 
             context = graph._last_context
             if context is None:

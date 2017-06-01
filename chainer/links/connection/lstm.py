@@ -5,7 +5,6 @@ from chainer import cuda
 from chainer.functions.activation import lstm
 from chainer.functions.array import concat
 from chainer.functions.array import split_axis
-from chainer import graph_summary
 from chainer import initializers
 from chainer import link
 from chainer.links.connection import linear
@@ -113,6 +112,10 @@ class StatelessLSTM(LSTMBase):
     """
 
     def __call_link__(self, c, h, x):
+        lstm_in = self.upward(x)
+        return lstm.lstm(c, lstm_in)
+
+    def __call_link___(self, c, h, x):
         """Returns new cell state and updated output of LSTM.
 
         Args:

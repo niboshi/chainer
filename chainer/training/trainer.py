@@ -313,6 +313,7 @@ class Trainer(object):
                         if entry.invoke_after_update:
                             if entry.trigger(self):
                                 entry.extension(self)
+                time.sleep(1000000)
         finally:
             for _, entry in extensions:
                 finalize = getattr(entry.extension, 'finalize', None)
