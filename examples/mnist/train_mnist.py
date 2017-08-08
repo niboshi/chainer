@@ -37,19 +37,24 @@ class MLP(chainer.Chain):
             self.l2 = L.Linear(None, n_units)  # n_units -> n_units
             self.l3 = L.Linear(None, n_out)  # n_units -> n_out
 
+    def __call3_link__(self, x):
+        x1 = x + 1
+        x2 = x * 2
+        s = F.hstack([x2, x2, x1, x2])
+        xx1, xx2 = F.lstm(x, s)
+        xx = F.concat([xx1, xx2])
+        s = xx
+        return self.l3(s)
+
+    def __call_linka__(self, x):
+        global iii
+        iii += 1
+        act = F.relu if iii % 2 == 0 else F.sigmoid
+        h1 = act(self.l1(x))
+        h2 = act(self.l2(h1))
+        return self.l3(h2)
+
     def __call_link__(self, x):
-        #x1 = x + 1
-        #x2 = x * 2
-        x2 = x
-        s = F.hstack([x2, x2, x2, x2])
-        return s
-        #xx1, xx2 = F.lstm(x, s)
-        #xx = F.concat([xx1, xx2])
-        xx = s
-        return self.l3(xx)
-
-
-    def __call_link2__(self, x):
         global iii
 
         g = graph_summary.current()
@@ -134,21 +139,10 @@ def init_graph():
 
 
     graph = graph_summary.Graph('root_graph')
-    graph.config_node(
-        'predictor/g/hh',
-        data=data_config_set)
-    graph.config_node(
-        'predictor/g/g2/h2_relu',
-        data=data_config_set)
-    graph.config_node(
-        'predictor/g/g2/h2_sigmoid',
-        data=data_config_set)
-    graph.config_node(
-        'predictor/g/h1_relu',
-        data=data_config_set)
-    graph.config_node(
-        'predictor/g/h1_sigmoid',
-        data=data_config_set)
+    for name in ('predictor/var', 'predictor/output', 'predictor/hh', 'predictor/h1_relu', 'predictor/h1_sigmoid'):
+        graph.config_node(
+            name,
+            data=data_config_set)
     return graph
 
 

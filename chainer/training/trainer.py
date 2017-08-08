@@ -301,7 +301,9 @@ class Trainer(object):
 
         # main training loop
         try:
+            i = 0
             while not stop_trigger(self):
+                time1 = time.time()
                 self.observation = {}
                 with reporter.scope(self.observation):
                     for name, entry in extensions:
@@ -313,7 +315,11 @@ class Trainer(object):
                         if entry.invoke_after_update:
                             if entry.trigger(self):
                                 entry.extension(self)
-                time.sleep(1000000)
+                time2 = time.time()
+                print("Trainer: {} sec".format(time2 - time1))
+                #if i == 0:
+                #    time.sleep(1000000)
+                #i += 1
         finally:
             for _, entry in extensions:
                 finalize = getattr(entry.extension, 'finalize', None)

@@ -52,7 +52,7 @@ def get_obj(path):
         tag = path_list.pop(0)
 
         # Subgraph?
-        graph_, _ = graph.get_subgraph(tag)
+        graph_ = graph.get_subgraph(tag)
         if graph_ is not None:
             graph = graph_
             continue
@@ -146,7 +146,7 @@ def api(api_name, path, query, environ):
 
                 #
                 if node.obj_type is _core.Graph:
-                    subgraph, _ = graph.get_subgraph(node.tag)
+                    subgraph = graph.get_subgraph(node.tag)
                     d_node['input_variables'] = [id(_) for _ in subgraph.input_nodes]
                     d_node['output_variables'] = [id(_) for _ in subgraph.output_nodes]
 
@@ -303,7 +303,7 @@ def graph_app(environ, start_response):
         if isinstance(data, str):
             data = data.encode('utf-8')
     else:
-        data = b'Error: Invalid request'
+        data = b'Error: Invalid request: ' + root_path.encode('utf8')
         content_type = 'text/plain'
 
     response = werkzeug.wrappers.Response(data)
