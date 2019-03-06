@@ -48,6 +48,26 @@ def _learning_rate(hp, t):
     return hp.alpha * math.sqrt(fix2) / fix1
 
 
+def _get_intermediate_dtype(dtype):
+    # Returns the dtype for intermediate calculation.
+    # For float16 input, float32 is used.
+    # Otherwise the same dtype as the parameter is used.
+    if dtype == numpy.float16:
+        return numpy.float32
+    return dtype
+
+
+def _inplace_axpby(x, a, b, y):
+    # in-place axpby: x = a * x + b * y
+    if isinstance(x, intel64.mdarray):
+        x.inplace_axpby(a, b, y)
+    else:
+        if a == 1:
+            x += b * y
+        else:
+            x[:] = a * x + b * y
+
+
 class AdamRule(optimizer.UpdateRule):
 
     """Update rule of Adam optimization algorithm.
@@ -105,11 +125,12 @@ class AdamRule(optimizer.UpdateRule):
 
     def init_state(self, param):
         xp = backend.get_array_module(param.data)
+        dtype = _get_intermediate_dtype(param.dtype.type)
         with cuda.get_device_from_array(param.data):
-            self.state['m'] = xp.zeros_like(param.data)
-            self.state['v'] = xp.zeros_like(param.data)
+            self.state['m'] = xp.zeros(param.data.shape, dtype)
+            self.state['v'] = xp.zeros(param.data.shape, dtype)
             if self.hyperparam.amsgrad:
-                self.state['vhat'] = xp.zeros_like(param.data)
+                self.state['vhat'] = xp.zeros(param.data.shape, dtype)
 
         # For iDeep
         if isinstance(param.data, intel64.mdarray):
@@ -118,58 +139,60 @@ class AdamRule(optimizer.UpdateRule):
             self.state['v'] = intel64.ideep.array(
                 self.state['v'], itype=intel64.ideep.wgt_array)
 
+    def _get_eps(self, interm_dtype):
+        hp = self.hyperparam
+        eps = interm_dtype(hp.eps)
+        if hp.eps != 0 and eps == 0:
+            raise ValueError(
+                'eps of Adam optimizer is too small for {} ({})'.format(
+                    interm_dtype.name, hp.eps))
+        return eps
+
     def update_core_cpu(self, param):
         grad = param.grad
         if grad is None:
             return
         hp = self.hyperparam
-        eps = grad.dtype.type(hp.eps)
-        if hp.eps != 0 and eps == 0:
-            raise ValueError(
-                'eps of Adam optimizer is too small for {} ({})'.format(
-                    grad.dtype.name, hp.eps))
+        dtype = _get_intermediate_dtype(param.dtype.type)
+        eps = self._get_eps(dtype)
+        grad = grad.astype(dtype, copy=False)
+
         m, v = self.state['m'], self.state['v']
-        if (isinstance(m, intel64.mdarray)
-                and isinstance(v, intel64.mdarray)):
-            m.inplace_axpby(1.0, 1.0 - hp.beta1, grad - m)
-            v.inplace_axpby(1.0, 1.0 - hp.beta2, grad*grad - v)
-            if hp.amsgrad:
-                vhat = self.state['vhat']
-                numpy.maximum(vhat, v, out=vhat)
-            else:
-                vhat = v
-            param.data.inplace_axpby(
-                1.0 - hp.weight_decay_rate, -hp.eta,
-                self.alpha_t * m / (numpy.sqrt(vhat) + hp.eps))
+
+        # m += (1 - beta1) * (grad - m)
+        _inplace_axpby(m, 1.0, 1.0 - hp.beta1, grad - m)
+        # v += (1 - beta2) * (grad * grad - v)
+        _inplace_axpby(v, 1.0, 1.0 - hp.beta2, grad*grad - v)
+
+        if hp.amsgrad:
+            vhat = self.state['vhat']
+            numpy.maximum(vhat, v, out=vhat)
         else:
-            m += (1 - hp.beta1) * (grad - m)
-            v += (1 - hp.beta2) * (grad * grad - v)
-            if hp.amsgrad:
-                vhat = self.state['vhat']
-                numpy.maximum(vhat, v, out=vhat)
-            else:
-                vhat = v
-            param.data -= hp.eta * (
-                self.alpha_t * m / (numpy.sqrt(vhat) + hp.eps) +
-                hp.weight_decay_rate * param.data)
+            vhat = v
+
+        # param -=
+        #  eta * (alpha_t * m / (sqrt(vhat) + eps) - weight_decay_rate * param)
+        _inplace_axpby(
+            param.data,
+            1.0 - hp.weight_decay_rate,
+            -hp.eta,
+            self.alpha_t * m / (numpy.sqrt(vhat) + eps))
 
     def update_core_gpu(self, param):
         grad = param.grad
         if grad is None:
             return
-
         hp = self.hyperparam
-        eps = grad.dtype.type(hp.eps)
-        if hp.eps != 0 and eps == 0:
-            raise ValueError(
-                'eps of Adam optimizer is too small for {} ({})'.format(
-                    grad.dtype.name, hp.eps))
+        dtype = _get_intermediate_dtype(param.dtype.type)
+        eps = self._get_eps(dtype)
+        grad = grad.astype(dtype, copy=False)
+
         if hp.amsgrad:
             if AdamRule._amsgrad_kernel is None:
                 AdamRule._amsgrad_kernel = cuda.elementwise(
                     'T grad, T alpha_t, T one_minus_beta1, T one_minus_beta2, '
                     'T eps, T eta, T weight_decay_rate',
-                    'T param, T m, T v, T vhat',
+                    'P param, T m, T v, T vhat',
                     '''m += one_minus_beta1 * (grad - m);
                        v += one_minus_beta2 * (grad * grad - v);
                        vhat = max(vhat, v);
@@ -178,7 +201,7 @@ class AdamRule(optimizer.UpdateRule):
                     'adam')
             AdamRule._amsgrad_kernel(
                 grad, self.alpha_t, 1 - hp.beta1,
-                1 - hp.beta2, hp.eps,
+                1 - hp.beta2, eps,
                 hp.eta, hp.weight_decay_rate,
                 param.data, self.state['m'], self.state['v'],
                 self.state['vhat'])
@@ -187,14 +210,14 @@ class AdamRule(optimizer.UpdateRule):
                 AdamRule._kernel = cuda.elementwise(
                     'T grad, T alpha_t, T one_minus_beta1, T one_minus_beta2, '
                     'T eps, T eta, T weight_decay_rate',
-                    'T param, T m, T v',
+                    'P param, T m, T v',
                     '''m += one_minus_beta1 * (grad - m);
                        v += one_minus_beta2 * (grad * grad - v);
                        param -= eta * (alpha_t * m / (sqrt(v) + eps) +
                                        weight_decay_rate * param);''',
                     'adam')
             AdamRule._kernel(grad, self.alpha_t, 1 - hp.beta1,
-                             1 - hp.beta2, hp.eps,
+                             1 - hp.beta2, eps,
                              hp.eta, hp.weight_decay_rate,
                              param.data, self.state['m'], self.state['v'])
 
