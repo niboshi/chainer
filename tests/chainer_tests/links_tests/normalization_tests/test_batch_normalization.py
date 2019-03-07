@@ -25,42 +25,31 @@ def _batch_normalization(expander, gamma, beta, x, mean, var, eps, test):
     return y_expect
 
 
-_parameterize = testing.parameterize(*(testing.product_dict(
-    testing.product({
-        'test': [True, False],
-        'dtype': [numpy.float16, numpy.float32, numpy.float64],
-        'size': ['skip', 'explicit'],
-    }),
-    testing.product({
-        'ndim': [0, 1, 2, 3],
-    }) + [
-        {'input_shape': (5, 4, 3, 2), 'axis': (0, 2, 3)},
-        {'input_shape': (5, 4), 'axis': 0},
-        {'input_shape': (5, 4, 3), 'axis': (0, 1)},
-    ]
-)))
-
-
-class BatchNormalizationTestBase(object):
+class BatchNormalizationTestImpl(testing.LinkTestImpl):
 
     param_names = ['gamma', 'beta']
 
-    def setUp(self):
-        if hasattr(self, 'axis') and hasattr(self, 'input_shape'):
-            aggr_axes = self.axis
+    def setup(self):
+        case = self.case
+        dtype = case.dtype
+        test = case.test
+
+        if hasattr(case, 'axis') and hasattr(case, 'input_shape'):
+            aggr_axes = case.axis
             if isinstance(aggr_axes, int):
                 aggr_axes = aggr_axes,
-            shape = self.input_shape
+            shape = case.input_shape
             param_shape = tuple(
                 s for i, s in enumerate(shape) if i not in aggr_axes)
             expander = tuple(
                 None if i in aggr_axes else slice(None)
                 for i in range(len(shape)))
-        elif hasattr(self, 'ndim'):
-            aggr_axes = (0,) + tuple(six.moves.range(2, self.ndim + 2))
-            shape = (5, 3) + (2,) * self.ndim
+        elif hasattr(case, 'ndim'):
+            ndim = case.ndim
+            aggr_axes = (0,) + tuple(six.moves.range(2, ndim + 2))
+            shape = (5, 3) + (2,) * ndim
             param_shape = shape[1]
-            expander = (None, Ellipsis) + (None,) * self.ndim
+            expander = (None, Ellipsis) + (None,) * ndim
         else:
             assert False
 
@@ -71,39 +60,36 @@ class BatchNormalizationTestBase(object):
         self.finetune = False
         self.eps = 2e-5
 
-        if self.test:
+        if test:
             self.mean = numpy.random.uniform(
-                -1, 1, self.param_shape).astype(self.dtype)
+                -1, 1, self.param_shape).astype(dtype)
             self.var = numpy.random.uniform(
-                0.5, 1, self.param_shape).astype(self.dtype)
+                0.5, 1, self.param_shape).astype(dtype)
         else:
             self.mean = None
             self.var = None
 
         self.check_forward_options = {'atol': 1e-4, 'rtol': 1e-3}
         self.check_backward_options = {'atol': 1e-4, 'rtol': 1e-3}
-        if self.dtype == numpy.float16:
+        if dtype == numpy.float16:
             self.check_forward_options = {'atol': 1e-2, 'rtol': 1e-1}
             self.check_backward_options = {'atol': 5e-1, 'rtol': 1e-1}
 
     def generate_params(self):
+        dtype = self.case.dtype
         initial_gamma = numpy.random.uniform(
-            -1, 1, self.param_shape).astype(self.dtype)
+            -1, 1, self.param_shape).astype(dtype)
         initial_beta = numpy.random.uniform(
-            -1, 1, self.param_shape).astype(self.dtype)
-        return initial_gamma, initial_beta
-
-    def get_initializers(self):
-        initial_gamma = [
-            initializers.Constant(2), 2, testing.link.InitializerPair(None, 1)]
-        initial_beta = [
-            initializers.Constant(2), 2, testing.link.InitializerPair(None, 0)]
+            -1, 1, self.param_shape).astype(dtype)
         return initial_gamma, initial_beta
 
     def create_link(self, initializers):
         initial_gamma, initial_beta = initializers
+        param_shape = self.case.param_shape
+        size = self.case.size
+        dtype = self.case.dtype
 
-        size = self.param_shape if self.size == 'explicit' else None
+        size = param_shape if size == 'explicit' else None
         initial_avg_mean = None if self.mean is None else self.mean.copy()
         initial_avg_var = None if self.var is None else self.var.copy()
 
@@ -111,7 +97,7 @@ class BatchNormalizationTestBase(object):
             size=size,
             axis=self.aggr_axes,
             eps=self.eps,
-            dtype=self.dtype,
+            dtype=dtype,
             initial_gamma=initial_gamma,
             initial_beta=initial_beta,
             initial_avg_mean=initial_avg_mean,
@@ -119,11 +105,15 @@ class BatchNormalizationTestBase(object):
         return link
 
     def generate_inputs(self):
-        x = numpy.random.uniform(-1, 1, self.shape).astype(self.dtype)
+        shape = self.case.shape
+        dtype = self.case.dtype
+        x = numpy.random.uniform(-1, 1, shape).astype(dtype)
         return x,
 
     def forward(self, link, inputs, device):
         x, = inputs
+        test = self.case.test
+        finetune = self.case.finetune
 
         # The inputs might be of different dtype than what the link was
         # initialized with. In that case, persistent values must be manually
@@ -133,8 +123,8 @@ class BatchNormalizationTestBase(object):
             link.avg_mean = link.avg_mean.astype(x.dtype)
             link.avg_var = link.avg_var.astype(x.dtype)
 
-        with chainer.using_config('train', not self.test):
-            y = link(x, finetune=self.finetune)
+        with chainer.using_config('train', not test):
+            y = link(x, finetune=finetune)
         return y,
 
     def forward_expected(self, inputs, params):
@@ -172,12 +162,48 @@ class BatchNormalizationTestBase(object):
         {'use_chainerx': True, 'chainerx_device': 'cuda:1'},
         {'use_chainerx': True, 'chainerx_device': 'cuda:1'},
     ])
-@_parameterize
-class BatchNormalizationTest(BatchNormalizationTestBase, testing.LinkTestCase):
+@testing.parameterize(*(testing.product_dict(
+    testing.product({
+        'test': [True, False],
+        'dtype': [numpy.float16, numpy.float32, numpy.float64],
+        'size': ['skip', 'explicit'],
+    }),
+    testing.product({
+        'ndim': [0, 1, 2, 3],
+    }) + [
+        {'input_shape': (5, 4, 3, 2), 'axis': (0, 2, 3)},
+        {'input_shape': (5, 4), 'axis': 0},
+        {'input_shape': (5, 4, 3), 'axis': (0, 1)},
+    ]
+)))
+class BatchNormalizationTest(testing.LinkTestCase):
 
-    pass
+    test_impl = BatchNormalizationTestImpl
 
 
+@testing.parameterize(*(testing.product_dict(
+    testing.product({
+        'dtype': [numpy.float16, numpy.float32, numpy.float64],
+    }))))
+class BatchNormalizationInitialiersTest(testing.LinkInitializersTestCase):
+
+    test_impl = BatchNormalizationTestImpl
+
+    test = False
+    size = 'skip'
+    ndim = 1
+    input_shape = (5, 4)
+    axis = 0
+
+    def get_initializers(self):
+        initial_gamma = [
+            initializers.Constant(2), 2, testing.link.InitializerPair(None, 1)]
+        initial_beta = [
+            initializers.Constant(2), 2, testing.link.InitializerPair(None, 0)]
+        return initial_gamma, initial_beta
+
+
+'''
 # TODO(hvy): Safely remove this test class when BackendConfig no longer
 # modifies the current device since those cases should be covered by the tests
 # above.
@@ -566,6 +592,6 @@ class TestFailChannalSizeInference(unittest.TestCase):
     def test_fail_inference(self):
         with self.assertRaises(RuntimeError):
             links.BatchNormalization()
-
+'''
 
 testing.run_module(__name__, __file__)
