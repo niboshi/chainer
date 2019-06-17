@@ -33,32 +33,30 @@ class ParallelMLP(chainer.Chain):
             self.second1.to_device(device1)
 
     def forward(self, x):
-        if self.device0 != self.device1:
-            # assume x is on device0
-            x1 = F.copy(x, self.device1)
+        # Though ParallelMLP behave as if it were a link on device 0, which
+        # means input `x` and output `y` are both on device 0, it distributes
+        # intermediate calculations in device 0 and device 1.
 
-            z0 = self.first0(x)
-            z1 = self.first1(x1)
+        # Fork
+        x0 = x
+        x1 = F.copy(x, self.device1)
 
-            # synchronize
-            h0 = z0 + F.copy(z1, self.device0)
-            h1 = z1 + F.copy(z0, self.device1)
+        # First parallel calculation
+        z0a = self.first0(x0)
+        z1a = self.first1(x1)
 
-            y0 = self.second0(F.relu(h0))
-            y1 = self.second1(F.relu(h1))
+        # Join and fork
+        h0 = z0a + F.copy(z1a, self.device0)
+        h1 = z1a + F.copy(z0a, self.device1)
 
-            y = y0 + F.copy(y1, self.device0)
-            return y  # output is on device0
-        else:
-            z0 = self.first0(x)
-            z1 = self.first1(x)
-            h = z0 + z1
+        # Second parallel calculation
+        z0b = self.second0(F.relu(h0))
+        z1b = self.second1(F.relu(h1))
 
-            y0 = self.second0(F.relu(h))
-            y1 = self.second1(F.relu(h))
-            y = y0 + y1
+        # Join
+        y = z0b + F.copy(z1b, self.device0)
 
-            return y
+        return y
 
 
 def main():
