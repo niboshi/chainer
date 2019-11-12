@@ -14,8 +14,10 @@ add_library(chainerx_testing STATIC
     util.cc
     routines.cc)
 
-# TODO(niboshi): Remove gtest dependency from testing
+# TODO(niboshi): Remove gtest dependency from testing. When fixed, add gtest
+# dependency to *_test libraries.
 target_link_libraries(chainerx_testing
+    PRIVATE
     gtest)
 
 if(${CHAINERX_BUILD_TEST})

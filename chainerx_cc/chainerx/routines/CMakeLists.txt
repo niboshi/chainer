@@ -59,9 +59,9 @@ if(${CHAINERX_BUILD_TEST})
       type_util_test.cc
   )
   target_link_libraries(chainerx_routines_test
+      PRIVATE
       chainerx
-      chainerx_routines
-      chainerx_testing
-      gtest)
+      # gtest is linked via chainerx_testing.
+      )
   add_test(NAME chainerx_routines_test COMMAND chainerx_routines_test)
 endif()
